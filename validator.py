@@ -5,16 +5,14 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--wallet_name",required=True)
     p.add_argument("--hotkey_name",required=True)
-    p.add_argument("--axon_port",type=int,default=8091)
-    p.add_argument("--netuid",type=int,default=128)
     p.add_argument("--network",default="finney")
+    p.add_argument("--netuid",type=int,default=128)
     args=p.parse_args()
 
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 
     sub=bt.subtensor(network=args.network)
     wallet=bt.wallet(name=args.wallet_name,hotkey=args.hotkey_name)
-    bt.axon(wallet=wallet,port=args.axon_port).start()
 
     netuid=args.netuid
     last=sub.block()
