@@ -20,20 +20,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import asyncio, bittensor as bt, comms, requests
+import asyncio, bittensor as bt, comms, requests, config
 
 NETWORK = "finney"
 sub = bt.subtensor(network=NETWORK)
 miner_data: dict[int, dict] = {}
 
-def cycle(netuid: int = 128, block: int = None, mg: bt.metagraph = None):
+def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
     ref = sub.get_timestamp(block)
     price = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",timeout=2).json()["price"])
 
     
     commits = sub.get_all_commitments(netuid)
+    print("commits",commits)
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
-    zero = bt.timelock.encrypt(str([0]*100), n_blocks=1, block_time=1)[0]
+    print("uid2hot",uid2hot)
+    zero = bt.timelock.encrypt(str([0]*config.FEATURE_LENGTH), n_blocks=1, block_time=1)[0]
 
     async def task(uid: int):
         hot = uid2hot.get(uid)
@@ -62,7 +64,7 @@ def cycle(netuid: int = 128, block: int = None, mg: bt.metagraph = None):
         miner_data[uid] = {"uid": uid, "hotkey": hot, "history": hist, "bucket": bucket, "blocks": blocks, "btc": btc}
 
     async def run():
-        await asyncio.gather(*(task(u) for u in range(256)))
+        await asyncio.gather(*(task(u) for u in range(config.NUM_UIDS)))
 
     try:
         asyncio.run(run())
