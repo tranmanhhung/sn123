@@ -73,7 +73,7 @@ Implements salience analysis using a multi-layer perceptron.
   - Normalizes delta losses to create weight distribution
   - Returns salience scores indicating each miner's predictive contribution
 
-### 5. Main Validator Loop (main.py)
+### 5. Validator Loop (validator.py)
 Coordinates the entire validation process.
 
 #### Utility Functions:
