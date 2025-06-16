@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import time, torch, bittensor as bt, argparse, threading, logging, ast; from cycle import cycle, miner_data; from model import salience as sal_fn
+import time, torch, bittensor as bt, argparse, threading, logging, ast; from cycle import cycle, miner_data; from model import salience as sal_fn; import config
 
 
 def commit_r2_bucket(bucket: str, wallet, hotkey, uid, subtensor):
@@ -36,8 +36,8 @@ def commit_r2_bucket(bucket: str, wallet, hotkey, uid, subtensor):
 
 
 def compute_salience():
-    N=256
-    LAG=300
+    N=config.NUM_UIDS
+    LAG=config.LAG
     lengths=[len(miner_data[u]["history"]) for u in range(N)]
     T=min(lengths)-LAG
     if T<=0:
@@ -49,14 +49,8 @@ def compute_salience():
             except:pass
         return None
 
-    first=dbytes(miner_data[0]["history"][0])
-    try:
-        sample=bt.timelock.decrypt(first) if first else None
-        if isinstance(sample,(bytes,bytearray)):sample=sample.decode()
-        D=100
-    except:
-        logging.warning('Failed to infer embedding dimension, defaulting to 100')
-        D=100
+
+    D=config.FEATURE_LENGTH
     dec={u:[] for u in range(N)}
     for t in range(T):
         for u in range(N):
@@ -80,32 +74,34 @@ def compute_salience():
         p=btc[i]; f=btc[i+LAG]
         if p and f and p!=0:
             pct[i]=(f-p)/p
+    print("salience computed")
     return sal_fn(dec, pct)
 
 
 
 def main():
     p=argparse.ArgumentParser()
-    p.add_argument("--wallet_name",required=True)
-    p.add_argument("--hotkey_name",required=True)
+    p.add_argument("--wallet.name",required=True)
+    p.add_argument("--wallet.hotkey",required=True)
     p.add_argument("--network",default="finney")
-    p.add_argument("--netuid",type=int,default=1)
+    p.add_argument("--netuid",type=int,default=123)
     args=p.parse_args()
 
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
 
     sub=bt.subtensor(network=args.network)
-    wallet=bt.wallet(name=args.wallet_name,hotkey=args.hotkey_name)
+    wallet=bt.wallet(name=getattr(args, 'wallet.name'),hotkey=getattr(args, 'wallet.hotkey'))
 
     netuid=args.netuid
-    last=sub.block()
-    next_task=last+360
+    last=sub.get_current_block()
+    next_task=last+config.TASK_INTERVAL
     task=None
     while True:
-        b=sub.block()
+        b=sub.get_current_block()
         if b!=last:
+            print("new block")
             mg=bt.metagraph(netuid=netuid,network=args.network,lite=True,sync=True)
-            b=sub.block()
+            b=sub.get_current_block()
             cycle(netuid,b,mg)
 
             if b>=next_task and (task is None or not task.is_alive()):
@@ -115,10 +111,11 @@ def main():
                         w=torch.tensor([sal[uid] if uid<len(sal) else 0.0 for uid in uid_list])
                         if w.sum()>0:
                             w=w/w.sum()
+                            print("setting weights",w)
                             sub.set_weights(netuid=netuid,wallet=wallet,uids=uid_list,weights=w,wait_for_inclusion=False)
                 task=threading.Thread(target=worker,args=(b,mg.uids),daemon=True)
                 task.start()
-                next_task=b+360
+                next_task=b+config.TASK_INTERVAL
             last=b
         time.sleep(2)
 
