@@ -19,7 +19,9 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
-
+from dotenv import load_dotenv
+import boto3
+import logging
 import os
 import json
 import asyncio
@@ -28,7 +30,12 @@ from typing import List, Dict
 from aiobotocore.session import get_session
 import aiohttp, email.utils
 import base64
-import logging
+from pathlib import Path
+from botocore.client import Config
+
+
+# Module logger
+logger = logging.getLogger(__name__)
 
 R2_BUCKET_ID = None
 def bucket():
@@ -270,3 +277,45 @@ def _sanitize_b64(obj):
     if isinstance(obj, list):
         return [_sanitize_b64(v) for v in obj]
     return obj
+
+
+def upload(bucket: str, object_key: str, file_path: str | Path) -> None:
+    """
+    Upload a local file to Cloudflare R2. If an object with the same key already
+    exists it will be replaced.
+
+    Parameters
+    ----------
+    bucket      Name of the R2 bucket.
+    object_key  Key (path/filename) inside the bucket.
+    file_path   Path to the local file to upload.
+
+    Environment variables (loaded via `.env` or shell):
+    ---------------------------------
+    R2_ACCOUNT_ID
+    R2_WRITE_ACCESS_KEY_ID
+    R2_WRITE_SECRET_ACCESS_KEY
+    """
+
+    # Populate env vars from a .env file if present.
+    load_dotenv()
+
+    account_id = os.environ["R2_ACCOUNT_ID"]
+    access_key = os.environ["R2_WRITE_ACCESS_KEY_ID"]
+    secret_key = os.environ["R2_WRITE_SECRET_ACCESS_KEY"]
+
+    endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
+
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name="auto",
+        config=Config(signature_version="s3v4"),  # R2 uses SigV4
+    )
+
+    logger.info("Uploading %s to bucket %s as %s", file_path, bucket, object_key)
+
+    s3.upload_file(str(file_path), bucket, object_key)
+    logger.info("✅ Uploaded %s → s3://%s/%s", file_path, bucket, object_key)
