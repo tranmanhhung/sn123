@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import asyncio, bittensor as bt, comms, requests, config
+import asyncio, bittensor as bt, requests, config, comms
 
 NETWORK = "finney"
 sub = bt.subtensor(network=NETWORK)
@@ -32,9 +32,10 @@ def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
 
     
     commits = sub.get_all_commitments(netuid)
-    print("commits",commits)
+    print("commits", commits)
+
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
-    print("uid2hot",uid2hot)
+    print("uid2hot", uid2hot)
     zero = bt.timelock.encrypt(str([0]*config.FEATURE_LENGTH), n_blocks=1, block_time=1)[0]
 
     async def task(uid: int):
@@ -47,21 +48,35 @@ def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
             hist = [zero] * len(hist)
             blocks = blocks[:len(hist)]
             btc = btc[:len(hist)]
-        bucket = commits.get(hot) if hot else None
+        object_url = commits.get(hot) if hot else None
         payload = zero
-        if bucket:
-            keys = await comms.list(bucket, "")
-            if len(keys) == 1:
-                k = keys[0]
-                ts = await comms.timestamp(bucket, k)
-                if not ts or ts <= ref:
-                    d = await comms.download(bucket, k)
-                    if isinstance(d, list) and len(d) >= 2 and d[0] == hot:
-                        payload = d[1]
+
+        if object_url:
+            try:
+                from urllib.parse import urlparse
+
+                path_parts = urlparse(object_url).path.lstrip("/").split("/")
+
+                object_name = path_parts[-1] if path_parts else ""
+
+                if object_name.lower() == (hot or "").lower():
+                    ts = await comms.timestamp(object_url)
+                    if ts is None or ts <= ref:
+                        payload = await comms.download(object_url)
+            except Exception as e:
+                print(f"Error processing payload for uid {uid}: {e}")
+                payload = zero
         hist.append(payload)
         blocks.append(block)
         btc.append(price)
-        miner_data[uid] = {"uid": uid, "hotkey": hot, "history": hist, "bucket": bucket, "blocks": blocks, "btc": btc}
+        miner_data[uid] = {
+            "uid": uid,
+            "hotkey": hot,
+            "history": hist,
+            "object_url": object_url,
+            "blocks": blocks,
+            "btc": btc,
+        }
 
     async def run():
         await asyncio.gather(*(task(u) for u in range(config.NUM_UIDS)))
