@@ -20,12 +20,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import time, torch, bittensor as bt, argparse, threading, logging, ast, requests, json
+import time, torch, bittensor as bt, argparse, threading, logging, ast, requests, json, gzip, os
 from cycle import cycle, miner_data
 from model import salience as sal_fn
 import config
 from config import ARCHIVE_URL
 
+
+def _deserialize_archive(data_bytes: bytes):
+    """Return dict[int, Any] from raw bytes, accepting optional gzip wrapper."""
+    try:
+        # Detect gzip by magic number 0x1f8b
+        if len(data_bytes) >= 2 and data_bytes[0] == 0x1F and data_bytes[1] == 0x8B:
+            data_bytes = gzip.decompress(data_bytes)
+    except Exception as e:
+        logging.warning("Gzip decompression failed: %s", e)
+
+    try:
+        import orjson  # type: ignore
+        return orjson.loads(data_bytes)
+    except Exception:
+        try:
+            return json.loads(data_bytes.decode())
+        except Exception as e:
+            logging.error("Archive JSON parse failed: %s", e)
+            raise
 
 def compute_salience():
     N=config.NUM_UIDS
@@ -108,7 +127,8 @@ def main():
         logging.info("Fetching initial miner_data archive from %s", ARCHIVE_URL)
         resp = requests.get(ARCHIVE_URL, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
+        data_bytes = resp.content
+        data = _deserialize_archive(data_bytes)
         miner_data.clear()
         for k, v in data.items():
             try:
@@ -151,3 +171,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
