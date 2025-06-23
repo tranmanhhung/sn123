@@ -21,6 +21,7 @@
 # THE SOFTWARE.
 
 import config
+import os, time
 
 FEATURE_LENGTH = config.FEATURE_LENGTH
 
@@ -28,7 +29,25 @@ import torch
 import torch.nn as nn
 import logging
 
+# Detect device once for the module
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger = logging.getLogger(__name__)
+logger.info("Salience computations will run on %s", DEVICE)
+
+try:
+    _NUM_CPU = max(1, os.cpu_count() or 1)
+    torch.set_num_threads(_NUM_CPU)
+    torch.set_num_interop_threads(_NUM_CPU)
+    logger.info("Torch thread pools set to %d", _NUM_CPU)
+except Exception as e:
+    logger.warning("Could not set torch thread counts: %s", e)
+
+try:
+    if hasattr(torch, "compile"):
+        logger.info("Enabling torch.compile() for MLP")
+        MLP = torch.compile(MLP)  # type: ignore
+except Exception as e:
+    logger.warning("torch.compile unavailable or failed: %s", e)
 
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -60,7 +79,6 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
     loss_type: str
         Loss type for the proxy model. Options: "mae" (default), "mape", "mse".
     """
-    import torch
     NUM_UIDS = config.NUM_UIDS
     emb_dim = len(next(iter(history_dict.values()))[0])
     T = min(len(next(iter(history_dict.values()))), len(btc_prices))
@@ -68,23 +86,21 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
     logger.info("Starting salience computation")
     logger.debug(f"NUM_UIDS={NUM_UIDS}, emb_dim={emb_dim}, T={T}")
 
-    X = torch.zeros(T, NUM_UIDS * emb_dim, dtype=torch.float32)
+    X = torch.zeros(T, NUM_UIDS * emb_dim, dtype=torch.float32, device=DEVICE)
     for uid in range(NUM_UIDS):
-        h = torch.tensor(history_dict[uid][:T], dtype=torch.float32)
+        h = torch.tensor(history_dict[uid][:T], dtype=torch.float32, device=DEVICE)
         X[:, uid * emb_dim : (uid + 1) * emb_dim] = h
-    y = torch.tensor(btc_prices[:T], dtype=torch.float32).view(-1, 1)
+    y = torch.tensor(btc_prices[:T], dtype=torch.float32, device=DEVICE).view(-1, 1)
 
     logger.debug(f"Feature matrix shape: {X.shape}, target vector shape: {y.shape}")
 
     def run_model(mask_uid=None):
         """Return average prediction loss using horizon-delayed updates.
 
-        If `mask_uid` is not None the corresponding embedding slice is
-        zeroed out at inference *and* training time to estimate its
-        marginal contribution (salience).
+        Adds verbose timing and progress logging.
         """
-
-        model = MLP(X.shape[1], hidden_size, 1)
+        t_start = time.time()
+        model = MLP(X.shape[1], hidden_size, 1).to(DEVICE)
         opt = torch.optim.Adam(model.parameters(), lr=lr)
         crit = nn.L1Loss()
 
@@ -96,7 +112,6 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
         total_loss = 0.0
 
         for t in range(T):
-
             inp = X[t : t + 1]
             if mask_uid is not None:
                 s = mask_uid * emb_dim
@@ -107,20 +122,35 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
             loss_eval = crit(pred, y[t : t + 1])
             total_loss += loss_eval.item()
 
+            logger.debug(
+                "step=%d | mask_uid=%s | pred=%.6f | target=%.6f | loss=%.6f",
+                t,
+                mask_uid,
+                pred.item() if pred.numel() == 1 else float(pred.squeeze()[0].item()),
+                y[t].item(),
+                loss_eval.item(),
+            )
 
             buf_x.append(inp.detach())
             buf_y.append(y[t : t + 1].detach())
 
-
             if len(buf_x) > lag:
                 xb = buf_x.pop(0)
                 yb = buf_y.pop(0)
-
                 opt.zero_grad()
                 train_loss = crit(model(xb), yb)
                 train_loss.backward()
                 opt.step()
 
+                logger.debug(
+                    "backprop | mask_uid=%s | train_loss=%.6f | buffer_size=%d",
+                    mask_uid,
+                    train_loss.item(),
+                    len(buf_x),
+                )
+
+        runtime = time.time() - t_start
+        logger.debug("run_model(mask_uid=%s) finished in %.2fs | avg_loss=%.6f", mask_uid, runtime, total_loss / T)
         return total_loss / T
 
     full_loss = run_model()
@@ -128,18 +158,20 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
 
     losses = []
     for uid in range(NUM_UIDS):
+        if uid % 32 == 0:
+            logger.info("Computing masked loss for UID %d/%d", uid, NUM_UIDS)
         if all(all(v == 0 for v in vec) for vec in history_dict[uid]):
             losses.append(full_loss) 
             continue
         l = run_model(uid)
         losses.append(l)
         if uid % 32 == 0:
-            logger.debug(f"Computed masked loss for UID {uid}: {l:.6f}")
+            logger.debug("Masked loss for UID %d: %.6f", uid, l)
 
     deltas = torch.tensor([l - full_loss for l in losses]).clamp(min=0.0)
     logger.debug(f"Delta losses tensor: {deltas}")
 
-    weights = (deltas / deltas.sum()).tolist() if deltas.sum() > 0 else [0.0] * NUM_UIDS
-    logger.info("Salience computation complete")
+    weights = (deltas.cpu() / deltas.sum().cpu()).tolist() if deltas.sum() > 0 else [0.0] * NUM_UIDS
+    logger.info("Salience computation complete in %.2fs", time.time() - t0)
 
     return weights
