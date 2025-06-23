@@ -1,38 +1,8 @@
-# MIT License
-#
-# Copyright (c) 2024 MANTIS
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-# THE SOFTWARE.
-
-import time, torch, bittensor as bt, argparse, threading, logging, ast; from cycle import cycle, miner_data; from model import salience as sal_fn; import config
-
-
-def commit_r2_bucket(bucket: str, wallet, hotkey, uid, subtensor):
-    try:
-        result = subtensor.commit(wallet, uid, bucket, 360)
-        assert result, "subtensor.commit did not return True"
-        return result
-    except Exception as e:
-        print(f"Error committing bucket: {e}")
-        return False
-
-
+import time, torch, bittensor as bt, argparse, threading, logging, ast, requests, json
+from cycle import cycle, miner_data
+from model import salience as sal_fn
+import config
+from config import ARCHIVE_URL
 
 
 def compute_salience():
@@ -57,16 +27,35 @@ def compute_salience():
             enc=miner_data[u]["history"][t]
             raw=dbytes(enc)
             try:
-                v=bt.timelock.decrypt(raw) if raw else [0]*D
-                if isinstance(v,(bytes,bytearray)):
-                    v=v.decode()
-                if isinstance(v,str):
-                    v=ast.literal_eval(v)
-                if not (isinstance(v,list) and len(v)==D):
-                    raise ValueError
-            except:
-                logging.warning(f'Invalid embedding, using zeros at uid {u} timestep {t}')
-                v=[0]*D
+                if not raw:
+                    raise ValueError("Empty payload")
+
+                try:
+                    v = bt.timelock.decrypt(raw)
+                except Exception as e:
+                    raise ValueError(f"Timelock decrypt failed: {e}") from e
+
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        v = v.decode()
+                    except Exception as e:
+                        raise ValueError(f"Byte->str decode failed: {e}") from e
+
+                if isinstance(v, str):
+                    try:
+                        v = ast.literal_eval(v)
+                    except Exception as e:
+                        raise ValueError(f"literal_eval failed: {e}") from e
+
+                if not (isinstance(v, list) and len(v) == D):
+                    raise ValueError(f"Expected list of length {D}, got type {type(v)} len {len(v) if isinstance(v,list) else 'N/A'}")
+
+                if any((not isinstance(x, (int, float)) or x < -1 or x > 1) for x in v):
+                    raise ValueError("Values out of [-1,1] range or non-numeric present")
+
+            except Exception as e:
+                logging.warning(f'Invalid embedding at uid {u} timestep {t}: {e}. Using zeros.')
+                v = [0] * D
             dec[u].append(v)
     btc=miner_data[0]["btc"]
     pct=[0.0]*T
@@ -91,6 +80,25 @@ def main():
 
     sub=bt.subtensor(network=args.network)
     wallet=bt.wallet(name=getattr(args, 'wallet.name'),hotkey=getattr(args, 'wallet.hotkey'))
+
+
+    try:
+        logging.info("Fetching initial miner_data archive from %s", ARCHIVE_URL)
+        resp = requests.get(ARCHIVE_URL, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        miner_data.clear()
+        for k, v in data.items():
+            try:
+                miner_data[int(k)] = v
+            except Exception:
+                continue
+        logging.info("Loaded %d UIDs from archive", len(miner_data))
+        if miner_data:
+            length = min(len(rec.get("history", [])) for rec in miner_data.values())
+            logging.info("Archive timestep length: %d", length)
+    except Exception as e:
+        logging.warning("Could not initialise miner_data from archive: %s", e)
 
     netuid=args.netuid
     last=sub.get_current_block()
