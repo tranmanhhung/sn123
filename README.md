@@ -1,191 +1,157 @@
-# MANTIS Bittensor Subnet Validator - Codebase Overview
+# MANTIS Bittensor Subnet Validator – Codebase Overview
 
 ## System Architecture
 
-This is a sophisticated Bittensor subnet validator (subnet 123) that implements a machine learning-based evaluation system for miner embeddings. The validator uses a commit-reveal scheme to collect encrypted embeddings from miners, evaluates their predictive power for Bitcoin price movements, and assigns network weights based on salience analysis.
+This repository implements a fully–featured Bittensor **validator** (subnet 123) that evaluates miners who broadcast time-locked Bitcoin-price embeddings. The validator performs four high-level tasks:
+
+1. **Collect** encrypted embeddings from miners and the reference Bitcoin spot price for every new block.
+2. **Archive & cache** the raw data via Cloudflare R2 to guarantee transparency and reproducibility.
+3. **Estimate salience** – i.e. the predictive contribution of each miner – with an online proxy-model that is trained on-chain.
+4. **Set network weights** proportional to salience so that the most useful miners receive the largest staking rewards.
 
 ## Core Components Overview
 
-### 1. Configuration Management (config.py)
-- **NETUID**: 123 - The Bittensor subnet identifier
-- **NUM_UIDS**: 256 - Maximum number of UIDs in the network
-- **FEATURE_LENGTH**: 100 - Dimensionality of embedding vectors
-- **HIDDEN_SIZE**: 64 - Neural network hidden layer size
-- **LEARNING_RATE**: 1e-3 - Training learning rate
-- **LAG**: 300 - Time lag for Bitcoin price prediction (blocks)
-- **TASK_INTERVAL**: 360 - Frequency of weight updates (blocks)
+### 1. Configuration Management (`config.py`)
+The single source-of-truth for tunable hyper-parameters.
 
-### 2. Cloud Storage Communication (comms.py)
-Manages asynchronous data exchange with Cloudflare R2 storage buckets.
+| Constant | Purpose |
+|----------|---------|
+| `ARCHIVE_URL` | Public URL hosting the latest `miner_data` snapshot. |
+| `NETUID` | Identifier of the Bittensor subnet (defaults to **123**). |
+| `NUM_UIDS` | Maximum number of permitted miner UIDs. |
+| `FEATURE_LENGTH` | Embedding vector dimensionality. |
+| `HIDDEN_SIZE` | Hidden layer width for the proxy MLP used during salience estimation. |
+| `LEARNING_RATE` | Learning rate for the proxy model optimiser. |
+| `LAG` | Prediction horizon (in blocks) when computing BTC percentage-change. |
+| `TASK_INTERVAL` | Number of blocks between successive weight-setting events. |
 
-#### Configuration Functions:
-- **bucket()**: Retrieves R2 bucket ID from environment variables
-- **load_r2_account_id()**: Gets Cloudflare account ID
-- **load_r2_endpoint_url()**: Constructs R2 endpoint URL
-- **load_r2_write_access_key_id()**: Retrieves write access key
-- **load_r2_write_secret_access_key()**: Retrieves secret access key
+### 2. Cloud Storage Communication (`comms.py`)
+Handles **all** interaction with Cloudflare R2:
 
-#### File Management Functions:
-- **get_local_path(bucket, filename)**: Computes local storage path in ~/storage/
-- **exists_locally(bucket, filename)**: Checks if file exists in local cache
-- **delete_locally(bucket, filename)**: Removes file from local storage
-- **load(bucket, filename)**: Loads JSON data from local file system
-- **download(bucket, filename)**: Downloads file from R2 and caches locally
-- **upload(bucket, filename, data)**: Uploads JSON data to R2 and saves locally
-- **exists(bucket, filename)**: Checks if file exists on R2 storage
-- **timestamp(bucket, filename)**: Gets last modification time from R2
-- **list(bucket, prefix)**: Lists all files with given prefix in R2 bucket
+#### Configuration Helpers
+- `bucket()` – Returns the active R2 bucket identifier from `R2_BUCKET_ID`.
+- `load_r2_account_id()` – Reads Cloudflare account ID from the environment.
+- `load_r2_endpoint_url()` – Builds the R2 S3-compatible endpoint URL.
+- `load_r2_write_access_key_id()` / `load_r2_write_secret_access_key()` – Credentials for signed writes.
 
-### 3. Data Collection Cycle (cycle.py)
-Orchestrates the periodic collection of miner data and Bitcoin prices.
+#### Local-Cache Utilities
+- `get_local_path(bucket, filename)` – Maps an object key to `~/storage/<bucket>/<file>`.
+- `exists_locally(bucket, filename)` – Async check for cached files.
+- `delete_locally(bucket, filename)` – Async removal of a cached file.
+- `load(bucket, filename)` – Async JSON loader from local disk.
 
-#### Global State:
-- **miner_data**: Dictionary mapping UID → {uid, hotkey, history, bucket, blocks, btc}
+#### Remote-Object Operations
+- `_local_path_from_url(url)` – Internal helper underpinning the HTTP cache.
+- `download(url)` – Fetches public objects (JSON / text / bytes) **and** persists them locally.
+- `exists(bucket, filename)` – Async S3 HEAD request to test object existence.
+- `timestamp(bucket, filename)` – Last-modified timestamp for a private R2 object.
+- `list(bucket, prefix)` – Glob-style listing of keys under a prefix.
+- `timestamp(url)` – (HTTP version) Last-Modified header scraper for public objects.
+- `_sanitize_b64(obj)` – Recursively base-64 encodes arbitrary binary blobs.
+- `upload(bucket, object_key, file_path)` – High-level wrapper that performs a signed PUT of a local file to R2.
 
-#### Main Function:
-- **cycle(netuid, block, mg)**: 
-  - Fetches current Bitcoin price from Binance API
-  - Retrieves commitment data from Bittensor network
-  - Creates mapping from UIDs to hotkeys
-  - Generates default zero embedding for absent data
-  - Asynchronously processes each UID:
-    - Maintains historical data per miner
-    - Resets history if hotkey changed (security measure)
-    - Downloads latest embedding from miner's R2 bucket
-    - Validates payload format and hotkey authenticity
-    - Appends new data to history, blocks, and BTC price arrays
-  - Updates global miner_data state
+> **Note** `new_comms.py` offers a _minimal_ read-only subset (`download`, `timestamp`) for consumer-only use-cases.
 
-### 4. Machine Learning Model (model.py)
-Implements salience analysis using a multi-layer perceptron.
+### 3. Data Collection Cycle (`cycle.py`)
+Continuously mirrors on-chain commitments into an in-memory Python structure called **`miner_data`**.
 
-#### Neural Network Architecture:
-- **MLP Class**: 3-layer neural network with ReLU and Tanh activations
-  - **__init__(input_size, hidden_size, output_size)**: Initializes layers
-  - **forward(x)**: Forward pass with ReLU → ReLU → Tanh activations
+Global state:
+```
+miner_data: Dict[int, {
+    uid:      int,
+    hotkey:   str | None,
+    history:  List[bytes | str],   # encrypted embeddings
+    object_url: str | None,        # R2 link advertised on-chain
+    blocks:   List[int],           # block-heights when data was seen
+    btc:      List[float],         # spot price at the same height
+}]
+```
 
-#### Salience Computation:
-- **salience(history_dict, btc_prices, hidden_size, lr)**:
-  - Constructs feature matrix from all miners' embeddings
-  - Trains baseline model to predict Bitcoin price changes
-  - For each UID, trains model with that UID's features masked to zero
-  - Computes performance degradation (delta loss) when each UID is removed
-  - Normalizes delta losses to create weight distribution
-  - Returns salience scores indicating each miner's predictive contribution
+Key routine:
+- `cycle(netuid, block, mg)`
+  1. Fetches the Binance BTC/USDT spot price.
+  2. Pulls the latest **commitments** (`subtensor.get_all_commitments`).
+  3. Builds a `uid → hotkey` lookup from the provided metagraph.
+  4. Downloads each miner's advertised object via `comms.download()` (size-capped to 25 MB).
+  5. Resets history if the miner rotates their hotkey (sybil defence).
+  6. Appends `(ciphertext, block, price)` to global `miner_data`.
 
-### 5. Validator Loop (validator.py)
-Coordinates the entire validation process.
+### 4. Machine Learning Model (`model.py`)
+Provides the lightweight proxy model used to quantify salience.
 
-#### Utility Functions:
-- **commit_r2_bucket(bucket, wallet, hotkey, uid, subtensor)**: Commits bucket to network
+#### `MLP` Class
+| Layer | Details |
+|-------|---------|
+| `Linear(input → hidden)` | Width = `HIDDEN_SIZE`; ReLU |
+| `Linear(hidden → hidden)` | Width = `HIDDEN_SIZE`; ReLU |
+| `Linear(hidden → 1)` | Output; **Tanh** activation |
 
-#### Core Logic:
-- **compute_salience()**:
-  - Validates sufficient historical data exists
-  - Decrypts timelock-encrypted embeddings from all miners
-  - Handles malformed data by substituting zeros
-  - Calculates Bitcoin price percentage changes with configured lag
-  - Calls salience function to compute predictive importance scores
+#### `salience(history_dict, btc_prices, …)`
+1. Builds a flattened feature matrix of shape `(T, NUM_UIDS × FEATURE_LENGTH)`.
+2. Trains the proxy MLP online using a **lagged** supervision scheme.
+3. For each UID, re-runs the forward pass with that UID's slice zeroed out to measure the increase in loss.
+4. Normalises positive delta-losses into a probability distribution → salience weights.
 
-- **main()**:
-  - Parses command-line arguments for wallet and network configuration
-  - Initializes Bittensor subtensor and wallet connections
-  - Runs continuous monitoring loop:
-    - Detects new blocks on the network
-    - Updates metagraph and calls cycle() for data collection
-    - Every TASK_INTERVAL blocks, spawns background thread to:
-      - Compute salience scores
-      - Normalize scores to probability distribution
-      - Set network weights based on miner performance
+### 5. Salience Evaluation Loop (`main.py`)
+Top-level orchestrator that bridges the on-chain world with the ML pipeline.
 
-### 6. Testing Suite (test_salience.py)
-Comprehensive test coverage for all major components.
+Important functions:
+- `compute_salience()` –
+  * Validates that all miners share a common history length ≥ `LAG`.
+  * Decrypts embeddings via `bt.timelock.decrypt` and performs exhaustive sanity checks.
+  * Calls `model.salience()` → returns a list of salience scores.
+- `main()` – CLI entry-point which:
+  1. Parses wallet / network flags.
+  2. Pre-loads `miner_data` from the public `ARCHIVE_URL` snapshot.
+  3. Enters an **infinite loop**:
+     - On every new block: calls `cycle()` to ingest fresh data.
+     - Every `TASK_INTERVAL` blocks: spawns a background thread that
+       i) recomputes salience, ii) normalises to `torch.Tensor`, and
+       iii) submits weights via `subtensor.set_weights()`.
 
-#### Test Categories:
-- **Basic Functionality Tests**:
-  - test_salience_all_zeros(): Validates handling of zero inputs
-  - test_mlp_initialization(): Verifies neural network setup
-  - test_mlp_forward(): Tests forward pass and output constraints
+### 6. Archive Decoder Utility (`decode.py`)
+Small CLI helper to _inspect_ the public miner-data archive:
+- `load_archive(url)` – Downloads the JSON snapshot and **re-casts** UID keys from strings → ints.
+- `main()` – Prints the timestep length and per-UID embedding counts for quick sanity checking.
 
-- **Data Variation Tests**:
-  - test_salience_with_varying_data(): Tests with non-zero varied inputs
-  - test_compute_salience_with_mock_data(): End-to-end test with mocked data
-
-- **Encryption Tests**:
-  - test_timelock_roundtrip(): Validates encryption/decryption cycle
-  - test_timelock_with_varying_data(): Tests with varied encrypted data
-  - test_end_to_end_salience_with_timelock(): Full integration test
+---
 
 ## System Workflow
 
-### 1. Initialization Phase
-- Validator starts with command-line wallet and network parameters
-- Establishes connection to Bittensor subtensor
-- Begins monitoring blockchain for new blocks
-
-### 2. Data Collection Phase (Every Block)
-- Updates network metagraph to get current miner information
-- For each miner UID:
-  - Fetches their committed R2 bucket identifier
-  - Downloads latest encrypted embedding if available
-  - Validates authenticity using hotkey verification
-  - Appends to historical data with current Bitcoin price
-
-### 3. Evaluation Phase (Every 360 Blocks)
-- Ensures sufficient historical data (> LAG blocks)
-- Decrypts all timelock-encrypted embeddings
-- Constructs training dataset with lagged Bitcoin returns as targets
-- Performs salience analysis to identify most predictive miners
-- Converts salience scores to normalized weight distribution
-
-### 4. Weight Setting Phase
-- Submits calculated weights to Bittensor network
-- Weights determine miner rewards based on their predictive contribution
-- Process repeats continuously with new data
+1. **Initialisation** – Validator launches, restores `miner_data` from the last published archive (if available) and connects to the Subtensor network.
+2. **Collection (every block)** – `cycle()` harvests commitments and BTC price, updating the in-memory dataset.
+3. **Evaluation (every `TASK_INTERVAL` blocks)** – Background thread decrypts embeddings, computes salience, and emits weights.
+4. **Reward Distribution** – `subtensor.set_weights()` finalises the weight vector on-chain; miners get paid proportionally.
 
 ## Security Considerations
 
-### Data Integrity
-- Timelock encryption prevents future-looking in embeddings
-- Hotkey validation ensures authentic data sources
-- Historical data reset when miner changes identity
-
-### Fault Tolerance
-- Graceful handling of malformed or missing data
-- Default zero embeddings for absent miners
-- Robust error handling in network and storage operations
+- **Time-lock encryption** ensures miners cannot cheat by encoding future information.
+- **Hotkey continuity** – History is reset when a UID changes hotkey, guarding against identity shuffle attacks.
+- **Payload size limits** stop denial-of-service via oversized objects.
+- **Environment isolation** – All R2 credentials are pulled from env-vars; none are hard-coded.
 
 ## Dependencies
 
-### Core Libraries
-- **bittensor**: Blockchain integration and timelock encryption
-- **torch**: Neural network implementation and tensor operations
-- **aiobotocore/boto3**: Asynchronous cloud storage operations
-- **requests**: External API calls for Bitcoin price data
+- `bittensor` – Blockchain client & timelock cryptography.
+- `torch` – Neural-network backbone.
+- `requests`, `aiohttp` – HTTP I/O (synchronous & asynchronous).
+- `aiobotocore`, `boto3` – Cloudflare R2 S3 compatibility.
+- `numpy`, `pandas` – Numeric utilities.
 
-### Supporting Libraries
-- **numpy**: Numerical computations
-- **pandas**: Data manipulation (if needed)
-- **ccxt**: Cryptocurrency exchange integration
+## Performance Notes
 
-## Performance Characteristics
-
-### Computational Complexity
-- O(N × T × D) for feature matrix construction (N=miners, T=timesteps, D=dimensions)
-- O(N × T × H) for salience computation with H hidden units
-- Parallelized data collection reduces latency
-
-### Storage Requirements
-- Local caching in ~/storage/ for redundancy
-- Cloud storage handles persistent miner data
-- Historical data grows linearly with time
+- **Feature matrix assembly** – O(`NUM_UIDS × T × FEATURE_LENGTH`).
+- **Proxy-model training** – Approximately O(`T × HIDDEN_SIZE × NUM_UIDS`).
+- **Asynchronous I/O** keeps data-collection latency negligible relative to block times.
 
 ## Extensibility
 
-The modular design allows for:
-- Different salience algorithms in model.py
-- Alternative storage backends in comms.py
-- Modified data collection strategies in cycle.py
-- Additional evaluation metrics in main.py
+The architecture is intentionally modular:
 
-This system represents a sophisticated approach to decentralized machine learning evaluation, combining blockchain technology with modern ML techniques for fair and automated miner assessment. 
+- Swap-in alternative salience algorithms by editing `model.py` only.
+- Use a different storage backend by replacing the functions in `comms.py`.
+- Increase embedding dimensionality by changing `FEATURE_LENGTH` – the model adapts automatically.
+
+---
+
+© 2024 MANTIS – Released under the MIT License.
