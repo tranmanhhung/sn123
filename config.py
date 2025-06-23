@@ -20,16 +20,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-
+ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/archive.data"
 
 NETUID = 123
 
 NUM_UIDS = 256
 
-FEATURE_LENGTH = 100  # Embedding dimension
+FEATURE_LENGTH = 100
 
 HIDDEN_SIZE = 64
 LEARNING_RATE = 1e-3
 
-LAG = 300  # Lag for BTC price calculation
-TASK_INTERVAL = 360  # Block interval for weight calculation and setting 
+LAG = 300 
+TASK_INTERVAL = 360 
