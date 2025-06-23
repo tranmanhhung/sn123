@@ -20,11 +20,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import asyncio, bittensor as bt, requests, config, comms
+import asyncio, bittensor as bt, requests, config, comms, logging, os
+
+logger = logging.getLogger(__name__)
 
 NETWORK = "finney"
 sub = bt.subtensor(network=NETWORK)
 miner_data: dict[int, dict] = {}
+
+# Reject payloads larger than 25 MB
+MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
 def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
     ref = sub.get_timestamp(block)
@@ -32,10 +37,10 @@ def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
 
     
     commits = sub.get_all_commitments(netuid)
-    print("commits", commits)
+    logger.debug("commits %s", commits)
 
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
-    print("uid2hot", uid2hot)
+    logger.debug("uid2hot mapping ready")
     zero = bt.timelock.encrypt(str([0]*config.FEATURE_LENGTH), n_blocks=1, block_time=1)[0]
 
     async def task(uid: int):
@@ -60,11 +65,25 @@ def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
                 object_name = path_parts[-1] if path_parts else ""
 
                 if object_name.lower() == (hot or "").lower():
-                    ts = await comms.timestamp(object_url)
-                    if ts is None or ts <= ref:
-                        payload = await comms.download(object_url)
+                    try:
+                        payload_raw = await comms.download(object_url)
+                    except Exception as e:
+                        logger.warning("Download failed for uid %s: %s", uid, e)
+                        payload_raw = None
+
+                    valid = False
+                    if isinstance(payload_raw, (bytes, bytearray)):
+                        valid = len(payload_raw) <= MAX_PAYLOAD_BYTES
+                    elif isinstance(payload_raw, str):
+                        valid = len(payload_raw.encode()) <= MAX_PAYLOAD_BYTES
+
+                    if payload_raw is None or not valid:
+                        logger.warning("Rejected payload for uid %s: size exceeds 25 MB", uid)
+                        payload = zero
+                    else:
+                        payload = payload_raw
             except Exception as e:
-                print(f"Error processing payload for uid {uid}: {e}")
+                logger.warning("Error processing payload for uid %s: %s", uid, e)
                 payload = zero
         hist.append(payload)
         blocks.append(block)
