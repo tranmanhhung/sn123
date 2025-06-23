@@ -20,13 +20,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-FEATURE_LENGTH = 100
+import config
+
+FEATURE_LENGTH = config.FEATURE_LENGTH
 
 import torch
 import torch.nn as nn
 import logging
 
-# Module-level logger
 logger = logging.getLogger(__name__)
 
 class MLP(nn.Module):
@@ -45,7 +46,7 @@ class MLP(nn.Module):
 
 
 
-def salience(history_dict, btc_prices, hidden_size=64, lr=1e-3):
+def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config.LEARNING_RATE, loss_type: str = "mae"):
     """Compute salience scores for each UID.
 
     history_dict: Dict[int, List[List[float]]]
@@ -56,9 +57,11 @@ def salience(history_dict, btc_prices, hidden_size=64, lr=1e-3):
         Hidden layer width for the small MLP used as a proxy model.
     lr: float
         Learning rate for the proxy model optimiser.
+    loss_type: str
+        Loss type for the proxy model. Options: "mae" (default), "mape", "mse".
     """
     import torch
-    NUM_UIDS = 256
+    NUM_UIDS = config.NUM_UIDS
     emb_dim = len(next(iter(history_dict.values()))[0])
     T = min(len(next(iter(history_dict.values()))), len(btc_prices))
 
@@ -74,30 +77,60 @@ def salience(history_dict, btc_prices, hidden_size=64, lr=1e-3):
     logger.debug(f"Feature matrix shape: {X.shape}, target vector shape: {y.shape}")
 
     def run_model(mask_uid=None):
+        """Return average prediction loss using horizon-delayed updates.
+
+        If `mask_uid` is not None the corresponding embedding slice is
+        zeroed out at inference *and* training time to estimate its
+        marginal contribution (salience).
+        """
+
         model = MLP(X.shape[1], hidden_size, 1)
         opt = torch.optim.Adam(model.parameters(), lr=lr)
-        crit = nn.MSELoss()
+        crit = nn.L1Loss()
+
+        lag = config.LAG
+
+        buf_x: list[torch.Tensor] = []
+        buf_y: list[torch.Tensor] = []
+
         total_loss = 0.0
-        for i in range(T):
-            inp = X[i : i + 1]
+
+        for t in range(T):
+
+            inp = X[t : t + 1]
             if mask_uid is not None:
                 s = mask_uid * emb_dim
                 inp = inp.clone()
                 inp[:, s : s + emb_dim] = 0.0
+
             pred = model(inp)
-            loss = crit(pred, y[i : i + 1])
-            total_loss += loss.item()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
+            loss_eval = crit(pred, y[t : t + 1])
+            total_loss += loss_eval.item()
+
+
+            buf_x.append(inp.detach())
+            buf_y.append(y[t : t + 1].detach())
+
+
+            if len(buf_x) > lag:
+                xb = buf_x.pop(0)
+                yb = buf_y.pop(0)
+
+                opt.zero_grad()
+                train_loss = crit(model(xb), yb)
+                train_loss.backward()
+                opt.step()
+
         return total_loss / T
 
     full_loss = run_model()
     logger.debug(f"Full (no-mask) model loss: {full_loss:.6f}")
 
-    # Compute loss with each UID masked; track progress every 32 UIDs for visibility.
     losses = []
     for uid in range(NUM_UIDS):
+        if all(all(v == 0 for v in vec) for vec in history_dict[uid]):
+            losses.append(full_loss) 
+            continue
         l = run_model(uid)
         losses.append(l)
         if uid % 32 == 0:
@@ -108,4 +141,5 @@ def salience(history_dict, btc_prices, hidden_size=64, lr=1e-3):
 
     weights = (deltas / deltas.sum()).tolist() if deltas.sum() > 0 else [0.0] * NUM_UIDS
     logger.info("Salience computation complete")
+
     return weights
