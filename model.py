@@ -29,7 +29,6 @@ import torch
 import torch.nn as nn
 import logging
 
-# Detect device once for the module
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logger = logging.getLogger(__name__)
 logger.info("Salience computations will run on %s", DEVICE)
@@ -42,12 +41,7 @@ try:
 except Exception as e:
     logger.warning("Could not set torch thread counts: %s", e)
 
-try:
-    if hasattr(torch, "compile"):
-        logger.info("Enabling torch.compile() for MLP")
-        MLP = torch.compile(MLP)  # type: ignore
-except Exception as e:
-    logger.warning("torch.compile unavailable or failed: %s", e)
+COMPILE_AVAILABLE = hasattr(torch, "compile")
 
 class MLP(nn.Module):
     def __init__(self, input_size, hidden_size, output_size):
@@ -63,7 +57,12 @@ class MLP(nn.Module):
         x = self.relu(self.layer2(x))
         return self.tanh(self.layer3(x))
 
-
+if COMPILE_AVAILABLE:
+    try:
+        logger.info("Enabling torch.compile() for MLP")
+        MLP = torch.compile(MLP)  # type: ignore[attr-defined]
+    except Exception as e:
+        logger.warning("torch.compile unavailable or failed post-definition: %s", e)
 
 def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config.LEARNING_RATE, loss_type: str = "mae"):
     """Compute salience scores for each UID.
@@ -80,16 +79,28 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
         Loss type for the proxy model. Options: "mae" (default), "mape", "mse".
     """
     NUM_UIDS = config.NUM_UIDS
-    emb_dim = len(next(iter(history_dict.values()))[0])
-    T = min(len(next(iter(history_dict.values()))), len(btc_prices))
+
+
+    active_uids = [uid for uid, h in history_dict.items() if isinstance(h, list) and len(h) > 0]
+    emb_dim = config.FEATURE_LENGTH
+
+    if not active_uids:
+        logger.info("No active histories provided – returning all-zero salience weights")
+        return [0.0] * NUM_UIDS
+
+    T = min(min(len(history_dict[uid]) for uid in active_uids), len(btc_prices))
 
     logger.info("Starting salience computation")
+    t0 = time.time()
     logger.debug(f"NUM_UIDS={NUM_UIDS}, emb_dim={emb_dim}, T={T}")
 
     X = torch.zeros(T, NUM_UIDS * emb_dim, dtype=torch.float32, device=DEVICE)
     for uid in range(NUM_UIDS):
-        h = torch.tensor(history_dict[uid][:T], dtype=torch.float32, device=DEVICE)
-        X[:, uid * emb_dim : (uid + 1) * emb_dim] = h
+        h_raw = history_dict.get(uid)
+        if not isinstance(h_raw, list) or len(h_raw) == 0:
+            continue
+        h_tensor = torch.tensor(h_raw[:T], dtype=torch.float32, device=DEVICE)
+        X[:, uid * emb_dim : (uid + 1) * emb_dim] = h_tensor
     y = torch.tensor(btc_prices[:T], dtype=torch.float32, device=DEVICE).view(-1, 1)
 
     logger.debug(f"Feature matrix shape: {X.shape}, target vector shape: {y.shape}")
@@ -104,12 +115,14 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
         opt = torch.optim.Adam(model.parameters(), lr=lr)
         crit = nn.L1Loss()
 
-        lag = config.LAG
+
 
         buf_x: list[torch.Tensor] = []
         buf_y: list[torch.Tensor] = []
 
         total_loss = 0.0
+
+        lag = config.LAG  # number of *samples* separating training and inference
 
         for t in range(T):
             inp = X[t : t + 1]
@@ -134,9 +147,13 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
             buf_x.append(inp.detach())
             buf_y.append(y[t : t + 1].detach())
 
+            # ----------------------
+            # Training (t - lag)
+            # ----------------------
             if len(buf_x) > lag:
                 xb = buf_x.pop(0)
                 yb = buf_y.pop(0)
+
                 opt.zero_grad()
                 train_loss = crit(model(xb), yb)
                 train_loss.backward()
@@ -160,7 +177,8 @@ def salience(history_dict, btc_prices, hidden_size=config.HIDDEN_SIZE, lr=config
     for uid in range(NUM_UIDS):
         if uid % 32 == 0:
             logger.info("Computing masked loss for UID %d/%d", uid, NUM_UIDS)
-        if all(all(v == 0 for v in vec) for vec in history_dict[uid]):
+        h_raw = history_dict.get(uid)
+        if not isinstance(h_raw, list) or len(h_raw) == 0 or all(all(v == 0 for v in vec) for vec in h_raw):
             losses.append(full_loss) 
             continue
         l = run_model(uid)
