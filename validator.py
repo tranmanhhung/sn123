@@ -20,155 +20,290 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-import time, torch, bittensor as bt, argparse, threading, logging, ast, requests, json, gzip, os
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import logging
+import os
+import threading
+import time
+from typing import Any
+
+import bittensor as bt
+import torch
+from dotenv import load_dotenv
+
+import config
 from cycle import cycle, miner_data
 from model import salience as sal_fn
-import config
-from config import ARCHIVE_URL
+import plaintext_utils as pt
 
+LOG_DIR = os.path.expanduser("~/mantis_logs")
+os.makedirs(LOG_DIR, exist_ok=True)
 
-def _deserialize_archive(data_bytes: bytes):
-    """Return dict[int, Any] from raw bytes, accepting optional gzip wrapper."""
-    try:
-        # Detect gzip by magic number 0x1f8b
-        if len(data_bytes) >= 2 and data_bytes[0] == 0x1F and data_bytes[1] == 0x8B:
-            data_bytes = gzip.decompress(data_bytes)
-    except Exception as e:
-        logging.warning("Gzip decompression failed: %s", e)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(os.path.join(LOG_DIR, "orchestrator.log"), mode="a"),
+    ],
+)
 
-    try:
-        import orjson  # type: ignore
-        return orjson.loads(data_bytes)
-    except Exception:
-        try:
-            return json.loads(data_bytes.decode())
-        except Exception as e:
-            logging.error("Archive JSON parse failed: %s", e)
-            raise
+ws_handler = logging.FileHandler(os.path.join(LOG_DIR, "weights_salience.log"), mode="a")
+ws_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s - %(message)s"))
+weights_logger = logging.getLogger("weights")
+weights_logger.setLevel(logging.DEBUG)
+weights_logger.addHandler(ws_handler)
 
-def compute_salience():
-    N=config.NUM_UIDS
-    LAG=config.LAG
-    lengths=[len(miner_data[u]["history"]) for u in range(N)]
-    T=min(lengths)-LAG
-    if T<=0:
-        return None
-    def dbytes(x):
-        if isinstance(x,(bytes,bytearray)):return bytes(x)
-        if isinstance(x,str):
-            try:return bytes.fromhex(x)
-            except:pass
-        return None
+logging.getLogger("model").addHandler(ws_handler)
+logging.getLogger("model").setLevel(logging.DEBUG)
 
+for noisy in ("websockets", "websockets.client", "websockets.server", "aiohttp"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    D=config.FEATURE_LENGTH
-    dec={u:[] for u in range(N)}
-    for t in range(T):
-        for u in range(N):
-            enc=miner_data[u]["history"][t]
-            raw=dbytes(enc)
+load_dotenv()
+
+def _init_from_archive() -> None:
+    """Populate `miner_data` from a previous `archive.data(.gz)` snapshot."""
+    import gzip, pathlib, requests
+
+    paths = [
+        pathlib.Path.home() / "archive.data.gz",
+        pathlib.Path.home() / "archive.data",
+    ]
+
+    log = logging.getLogger("archive")
+    data_bytes: bytes | None = None
+
+    for p in paths:
+        if p.exists():
             try:
-                if not raw:
-                    raise ValueError("Empty payload")
-
-                try:
-                    v = bt.timelock.decrypt(raw)
-                except Exception as e:
-                    raise ValueError(f"Timelock decrypt failed: {e}") from e
-
-                if isinstance(v, (bytes, bytearray)):
-                    try:
-                        v = v.decode()
-                    except Exception as e:
-                        raise ValueError(f"Byte->str decode failed: {e}") from e
-
-                if isinstance(v, str):
-                    try:
-                        v = ast.literal_eval(v)
-                    except Exception as e:
-                        raise ValueError(f"literal_eval failed: {e}") from e
-
-                if not (isinstance(v, list) and len(v) == D):
-                    raise ValueError(f"Expected list of length {D}, got type {type(v)} len {len(v) if isinstance(v,list) else 'N/A'}")
-
-                if any((not isinstance(x, (int, float)) or x < -1 or x > 1) for x in v):
-                    raise ValueError("Values out of [-1,1] range or non-numeric present")
-
+                log.info("🗄️  Loading miner_data from %s", p)
+                data_bytes = p.read_bytes()
+                if p.suffix == ".gz":
+                    data_bytes = gzip.decompress(data_bytes)
+                break
             except Exception as e:
-                logging.warning(f'Invalid embedding at uid {u} timestep {t}: {e}. Using zeros.')
-                v = [0] * D
-            dec[u].append(v)
-    btc=miner_data[0]["btc"]
-    pct=[0.0]*T
-    for i in range(T):
-        p=btc[i]; f=btc[i+LAG]
-        if p and f and p!=0:
-            pct[i]=(f-p)/p
-    print("salience computed")
-    return sal_fn(dec, pct)
+                log.warning("Failed to load %s: %s", p, e)
 
+    if data_bytes is None:
+        url = getattr(config, "ARCHIVE_URL", None)
+        if url:
+            try:
+                log.info("🌐 Fetching miner_data archive from %s", url)
+                r = requests.get(url, timeout=30)
+                r.raise_for_status()
+                data_bytes = r.content
+            except Exception as e:
+                log.warning("Remote archive fetch failed: %s", e)
 
-
-def main():
-    p=argparse.ArgumentParser()
-    p.add_argument("--wallet.name",required=True)
-    p.add_argument("--wallet.hotkey",required=True)
-    p.add_argument("--network",default="finney")
-    p.add_argument("--netuid",type=int,default=123)
-    args=p.parse_args()
-
-    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
-
-    sub=bt.subtensor(network=args.network)
-    wallet=bt.wallet(name=getattr(args, 'wallet.name'),hotkey=getattr(args, 'wallet.hotkey'))
-
+    if data_bytes is None:
+        log.info("No archive found – starting with empty miner_data")
+        return
 
     try:
-        logging.info("Fetching initial miner_data archive from %s", ARCHIVE_URL)
-        resp = requests.get(ARCHIVE_URL, timeout=30)
-        resp.raise_for_status()
-        data_bytes = resp.content
-        data = _deserialize_archive(data_bytes)
+        try:
+            import orjson  # type: ignore
+
+            obj = orjson.loads(data_bytes)
+        except ImportError:
+            obj = json.loads(data_bytes.decode())
+
         miner_data.clear()
-        for k, v in data.items():
+        for k, v in obj.items():
             try:
                 miner_data[int(k)] = v
             except Exception:
                 continue
-        logging.info("Loaded %d UIDs from archive", len(miner_data))
+
+        log.info("✓ Restored miner_data for %d UIDs from archive", len(miner_data))
         if miner_data:
-            length = min(len(rec.get("history", [])) for rec in miner_data.values())
-            logging.info("Archive timestep length: %d", length)
+            lengths = [
+                len(rec.get("history"))
+                for rec in miner_data.values()
+                if isinstance(rec.get("history"), list)
+            ]
+            if lengths:
+                log.info("Archive timestep length: %d", min(lengths))
     except Exception as e:
-        logging.warning("Could not initialise miner_data from archive: %s", e)
+        log.warning("Failed to parse archive: %s", e)
 
-    netuid=args.netuid
-    last=sub.get_current_block()
-    next_task=last+config.TASK_INTERVAL
-    task=None
+    PLAINTEXT_PATH = os.path.expanduser("~/plaintext.data.gz")
+    if not os.path.exists(PLAINTEXT_PATH):
+        remote_pt = getattr(config, "ARCHIVE_URL_PLAINTEXT", None)
+        if remote_pt:
+            try:
+                import requests
+                logging.info("🌐 Fetching plaintext archive from %s", remote_pt)
+                r = requests.get(remote_pt, timeout=30)
+                r.raise_for_status()
+                with open(PLAINTEXT_PATH, "wb") as f:
+                    f.write(r.content)
+                logging.info("✓ Saved remote plaintext archive to %s", PLAINTEXT_PATH)
+            except Exception as e:
+                logging.warning("Remote plaintext fetch failed: %s", e)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--wallet.name", required=True)
+    p.add_argument("--wallet.hotkey", required=True)
+    p.add_argument("--network", default="finney")
+    p.add_argument("--netuid", type=int, default=123)
+    args = p.parse_args()
+
+    _init_from_archive()
+
+    pt.load_plaintext()
+    pt.update_plaintext(miner_data)
+
+    sub = bt.subtensor(network=args.network)
+    wallet = bt.wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
+
+    netuid = args.netuid
+
+    try:
+        mg_start = bt.metagraph(netuid=netuid, network=args.network, lite=True, sync=True)
+        min_hist = min(
+            (
+                len(rec.get("history"))
+                for rec in miner_data.values()
+                if isinstance(rec.get("history"), list)
+            ),
+            default=0,
+        )
+
+        if min_hist >= 2 * config.LAG + 1:
+            initial_sal = pt.compute_salience_from_plaintext(sal_fn)
+        else:
+            initial_sal = None
+        if initial_sal:
+            w_init = torch.tensor([initial_sal[uid] if uid < len(initial_sal) else 0.0 for uid in mg_start.uids])
+            if w_init.sum() > 0:
+                w_init = w_init / w_init.sum()
+                sub.set_weights(
+                    netuid=netuid,
+                    wallet=wallet,
+                    uids=mg_start.uids,
+                    weights=w_init,
+                    wait_for_inclusion=False,
+                )
+                weights_logger.info("✓ Initial set_weights submitted immediately after archive load (max=%.4f)", w_init.max())
+        else:
+            weights_logger.info("Archive loaded but not enough data yet for initial salience computation")
+    except Exception as e:
+        weights_logger.warning("Initial salience/weights failed: %s", e)
+
+    last_block = sub.get_current_block()
+    next_task = last_block + config.TASK_INTERVAL
+    weight_thread: threading.Thread | None = None
+
     while True:
-        b=sub.get_current_block()
-        if b!=last:
-            print("new block")
-            mg=bt.metagraph(netuid=netuid,network=args.network,lite=True,sync=True)
-            b=sub.get_current_block()
-            cycle(netuid,b,mg)
+        blk = sub.get_current_block()
+        if blk != last_block:
+            if blk % config.SAMPLE_STEP != 0:
+                last_block = blk
+                time.sleep(1)
+                continue
 
-            if b>=next_task and (task is None or not task.is_alive()):
-                def worker(block_snapshot,uid_list):
-                    sal=compute_salience()
-                    if sal:
-                        w=torch.tensor([sal[uid] if uid<len(sal) else 0.0 for uid in uid_list])
-                        if w.sum()>0:
-                            w=w/w.sum()
-                            print("setting weights",w)
-                            sub.set_weights(netuid=netuid,wallet=wallet,uids=uid_list,weights=w,wait_for_inclusion=False)
-                task=threading.Thread(target=worker,args=(b,mg.uids),daemon=True)
-                task.start()
-                next_task=b+config.TASK_INTERVAL
-            last=b
+            logging.info("🪙 New block %s", blk)
+
+            mg: bt.metagraph | None = None
+            for attempt in range(1, 4):
+                try:
+                    mg = bt.metagraph(netuid=netuid, network=args.network, lite=True, sync=True)
+                    break
+                except Exception as e:
+                    logging.warning("Metagraph fetch failed (attempt %d/3): %s", attempt, e)
+                    time.sleep(2)
+            if mg is None:
+                last_block = blk
+                continue
+
+            stats = cycle(netuid, blk, mg)
+            try:
+                committed = stats.get("committed", 0)
+                valid = stats.get("valid", 0)
+                pct_valid = (valid / committed * 100.0) if committed else 0.0
+                logging.info(
+                    "Block %s | payload quality: %.1f%% (%d/%d)",
+                    blk,
+                    pct_valid,
+                    valid,
+                    committed,
+                )
+            except Exception:
+                pass
+
+            if blk >= next_task and (weight_thread is None or not weight_thread.is_alive()):
+
+                def worker(block_snapshot: int, uid_list):
+                    weights_logger.info("=== Weight computation start | block %s ===", block_snapshot)
+                    pt.update_plaintext(miner_data)
+
+                    min_hist_len = min(
+                        (
+                            len(r.get("history"))
+                            for r in miner_data.values()
+                            if isinstance(r.get("history"), list)
+                        ),
+                        default=0,
+                    )
+                    if min_hist_len < 2 * config.LAG + 1:
+                        weights_logger.info(
+                            "History too short (%d < %d) – deferring salience", 
+                            min_hist_len,
+                            2 * config.LAG + 1,
+                        )
+                        return
+
+                    sal = pt.compute_salience_from_plaintext(sal_fn)
+                    if not sal:
+                        weights_logger.info("Salience unavailable – skipping at block %s", block_snapshot)
+                        return
+
+                    w = torch.tensor([sal[uid] if uid < len(sal) else 0.0 for uid in uid_list])
+                    if w.sum() <= 0:
+                        weights_logger.warning("Zero-sum weights at block %s – skip", block_snapshot)
+                        return
+
+                    w = w / w.sum()
+                    try:
+                        sub.set_weights(
+                            netuid=netuid,
+                            wallet=wallet,
+                            uids=uid_list,
+                            weights=w,
+                            wait_for_inclusion=False,
+                        )
+                        weights_logger.info(
+                            "✓ set_weights submitted at block %s (max=%.4f)",
+                            block_snapshot,
+                            w.max(),
+                        )
+                    except Exception as e:
+                        if "RateLimit" in str(e):
+                            weights_logger.warning("Rate limit exceeded – delaying next weight update by 30s")
+                            time.sleep(30)
+                        weights_logger.exception("set_weights failed at block %s: %s", block_snapshot, e)
+                    finally:
+                        weights_logger.info("=== Weight computation end | block %s ===", block_snapshot)
+
+                weight_thread = threading.Thread(target=worker, args=(blk, mg.uids), daemon=True)
+                weight_thread.start()
+                next_task = blk + config.TASK_INTERVAL
+
+            pt.update_plaintext(miner_data)
+
+            if blk % 30 == 0:
+                pt.save_plaintext()
+
+            last_block = blk
         time.sleep(2)
 
-if __name__=="__main__":
+
+if __name__ == "__main__":
     main()
 
