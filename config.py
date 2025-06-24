@@ -20,7 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
-ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/archive.data"
+ARCHIVE_URL = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/archive.data.gz"
+ARCHIVE_URL_PLAINTEXT = "https://pub-879ad825983e43529792665f4f510cd6.r2.dev/plaintext.data.gz"
 
 NETUID = 123
 
@@ -31,5 +32,8 @@ FEATURE_LENGTH = 100
 HIDDEN_SIZE = 64
 LEARNING_RATE = 1e-3
 
-LAG = 300 
+SAMPLE_STEP = 5  # take one payload every 5 blocks (~60 s on Finney)
+
+LAG = 60  # ≈ 60 minutes look-ahead window
+
 TASK_INTERVAL = 360 
