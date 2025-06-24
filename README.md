@@ -12,16 +12,15 @@ A lean **validator** for Bittensor subnet **123** that ranks miners broadcasting
 ## Minimal Architecture Diagram
 
 ```mermaid
-graph TD;
-  A[Blockchain (Subtensor)] -- commitments --> B(cycle.py);
-  B -- data snapshots --> C[memory: miner_data];
-  C -- training data --> D(model.py);
-  D -- salience scores --> E[main.py];
-  E -- set_weights --> A;
-  C -- gzip archive --> F[Cloudflare R2 (comms.py)];
+graph TD
+    A["Blockchain (Subtensor)"] -->|"commitments"| B(cycle.py)
+    B -->|"data snapshots"| C["memory: miner_data"]
+    C -->|"training data"| D(model.py)
+    D -->|"salience scores"| E(main.py)
+    E -->|"set_weights"| A
+    C -->|"gzip archive"| F["Cloudflare R2 (comms.py)"]
 ```
 
----
 
 ## Core Modules
 
