@@ -146,9 +146,9 @@ def main():
             ):
 
                 def worker(block_snapshot: int, metagraph: bt.metagraph):
-                        weights_logger.info(
+                    weights_logger.info(
                         f"=== Weight computation start | block {block_snapshot} ==="
-                        )
+                    )
                     training_data = datalog.get_training_data()
                     if not training_data:
                         weights_logger.warning("Not enough data to compute salience.")
@@ -197,11 +197,10 @@ def main():
                 datalog.save(DATALOG_PATH)
                 next_save = current_block + SAVE_INTERVAL
 
-                    except Exception as e:
+        except Exception as e:
             logging.error(f"An unexpected error occurred in the main loop: {e}", exc_info=True)
             time.sleep(10)
 
 
 if __name__ == "__main__":
     main()
-
