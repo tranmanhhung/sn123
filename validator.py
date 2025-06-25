@@ -159,7 +159,10 @@ def main():
     _init_from_archive()
 
     pt.load_plaintext()
-    pt.update_plaintext(miner_data)
+    
+    logging.info("Starting initial plaintext update in the background.")
+    initial_plaintext_thread = threading.Thread(target=pt.update_plaintext, args=(miner_data,), daemon=True)
+    initial_plaintext_thread.start()
 
     sub = bt.subtensor(network=args.network)
     wallet = bt.wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
@@ -168,41 +171,43 @@ def main():
 
     weight_queue: "queue.Queue[tuple[int, list[int], list[float]]]" = queue.Queue()
 
-    try:
-        mg_start = bt.metagraph(netuid=netuid, network=args.network, lite=True, sync=True)
-        min_hist = min(
-            (
-                len(rec.get("history"))
-                for rec in miner_data.values()
-                if isinstance(rec.get("history"), list)
-            ),
-            default=0,
-        )
+    # try:
+    #     mg_start = bt.metagraph(netuid=netuid, network=args.network, lite=True, sync=True)
+    #     min_hist = min(
+    #         (
+    #             len(rec.get("history"))
+    #             for rec in miner_data.values()
+    #             if isinstance(rec.get("history"), list)
+    #         ),
+    #         default=0,
+    #     )
 
-        if min_hist >= 2 * config.LAG + 1:
-            initial_sal = pt.compute_salience_from_plaintext(sal_fn)
-        else:
-            initial_sal = None
-        if initial_sal:
-            w_init = torch.tensor([initial_sal[uid] if uid < len(initial_sal) else 0.0 for uid in mg_start.uids])
-            if w_init.sum() > 0:
-                w_init = w_init / w_init.sum()
-                sub.set_weights(
-                    netuid=netuid,
-                    wallet=wallet,
-                    uids=mg_start.uids,
-                    weights=w_init,
-                    wait_for_inclusion=False,
-                )
-                weights_logger.info("✓ Initial set_weights submitted immediately after archive load (max=%.4f)", w_init.max())
-        else:
-            weights_logger.info("Archive loaded but not enough data yet for initial salience computation")
-    except Exception as e:
-        weights_logger.warning("Initial salience/weights failed: %s", e)
+    #     if min_hist >= 2 * config.LAG + 1:
+    #         initial_sal = pt.compute_salience_from_plaintext(sal_fn)
+    #     else:
+    #         initial_sal = None
+    #     if initial_sal:
+    #         w_init = torch.tensor([initial_sal[uid] if uid < len(initial_sal) else 0.0 for uid in mg_start.uids])
+    #         if w_init.sum() > 0:
+    #             w_init = w_init / w_init.sum()
+    #             sub.set_weights(
+    #                 netuid=netuid,
+    #                 wallet=wallet,
+    #                 uids=mg_start.uids,
+    #                 weights=w_init,
+    #                 wait_for_inclusion=False,
+    #             )
+    #             weights_logger.info("✓ Initial set_weights submitted immediately after archive load (max=%.4f)", w_init.max())
+    #     else:
+    #         weights_logger.info("Archive loaded but not enough data yet for initial salience computation")
+    # except Exception as e:
+    #     weights_logger.warning("Initial salience/weights failed: %s", e)
 
     last_block = sub.get_current_block()
     next_task = last_block + config.TASK_INTERVAL
     weight_thread: threading.Thread | None = None
+    next_plaintext_update = last_block + config.PLAINTEXT_UPDATE_INTERVAL
+    plaintext_update_task: threading.Thread | None = None
 
     while True:
         blk = sub.get_current_block()
@@ -241,11 +246,27 @@ def main():
             except Exception:
                 pass
 
+            if blk >= next_plaintext_update and (plaintext_update_task is None or not plaintext_update_task.is_alive()):
+                def plaintext_worker(block_snapshot: int):
+                    logging.info("=== Plaintext update start | block %s ===", block_snapshot)
+                    pt.update_plaintext(miner_data)
+                    logging.info("=== Plaintext update end | block %s ===", block_snapshot)
+
+                plaintext_update_task = threading.Thread(target=plaintext_worker, args=(blk,), daemon=True)
+                plaintext_update_task.start()
+                logging.info("Plaintext update thread started for block %d.", blk)
+                next_plaintext_update = blk + config.PLAINTEXT_UPDATE_INTERVAL
+
+            if blk > 0 and blk % 30 == 0:
+                logging.info("Saving plaintext...")
+                pt.save_plaintext()
+                logging.info("Plaintext saved.")
+
             if blk >= next_task and (weight_thread is None or not weight_thread.is_alive()):
 
                 def worker(block_snapshot: int, uid_list, out_q: "queue.Queue[tuple[int, list[int], list[float]]]"):
                     weights_logger.info("=== Weight computation start | block %s ===", block_snapshot)
-                    pt.update_plaintext(miner_data)
+                    # pt.update_plaintext(miner_data) # Removed
 
                     try:
                         horizon = min(
@@ -304,7 +325,7 @@ def main():
                 weight_thread.start()
                 next_task = blk + config.TASK_INTERVAL
 
-            pt.update_plaintext(miner_data)
+            # pt.update_plaintext(miner_data) # Removed
 
             if blk % 30 == 0:
                 pt.save_plaintext()
