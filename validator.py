@@ -30,6 +30,7 @@ import os
 import threading
 import time
 from typing import Any
+import queue
 
 import bittensor as bt
 import torch
@@ -39,6 +40,7 @@ import config
 from cycle import cycle, miner_data
 from model import salience as sal_fn
 import plaintext_utils as pt
+from plaintext_utils import plaintext_miner_data
 
 LOG_DIR = os.path.expanduser("~/mantis_logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -131,20 +133,20 @@ def _init_from_archive() -> None:
     except Exception as e:
         log.warning("Failed to parse archive: %s", e)
 
-    PLAINTEXT_PATH = os.path.expanduser("~/plaintext.data.gz")
-    if not os.path.exists(PLAINTEXT_PATH):
-        remote_pt = getattr(config, "ARCHIVE_URL_PLAINTEXT", None)
-        if remote_pt:
-            try:
-                import requests
-                logging.info("🌐 Fetching plaintext archive from %s", remote_pt)
-                r = requests.get(remote_pt, timeout=30)
-                r.raise_for_status()
-                with open(PLAINTEXT_PATH, "wb") as f:
-                    f.write(r.content)
-                logging.info("✓ Saved remote plaintext archive to %s", PLAINTEXT_PATH)
-            except Exception as e:
-                logging.warning("Remote plaintext fetch failed: %s", e)
+    # PLAINTEXT_PATH = os.path.expanduser("~/plaintext.data.gz")
+    # if not os.path.exists(PLAINTEXT_PATH):
+    #     remote_pt = getattr(config, "ARCHIVE_URL_PLAINTEXT", None)
+    #     if remote_pt:
+    #         try:
+    #             import requests
+    #             logging.info("🌐 Fetching plaintext archive from %s", remote_pt)
+    #             r = requests.get(remote_pt, timeout=30)
+    #             r.raise_for_status()
+    #             with open(PLAINTEXT_PATH, "wb") as f:
+    #                 f.write(r.content)
+    #             logging.info("✓ Saved remote plaintext archive to %s", PLAINTEXT_PATH)
+    #         except Exception as e:
+    #             logging.warning("Remote plaintext fetch failed: %s", e)
 
 def main():
     p = argparse.ArgumentParser()
@@ -163,6 +165,8 @@ def main():
     wallet = bt.wallet(name=getattr(args, "wallet.name"), hotkey=getattr(args, "wallet.hotkey"))
 
     netuid = args.netuid
+
+    weight_queue: "queue.Queue[tuple[int, list[int], list[float]]]" = queue.Queue()
 
     try:
         mg_start = bt.metagraph(netuid=netuid, network=args.network, lite=True, sync=True)
@@ -239,9 +243,26 @@ def main():
 
             if blk >= next_task and (weight_thread is None or not weight_thread.is_alive()):
 
-                def worker(block_snapshot: int, uid_list):
+                def worker(block_snapshot: int, uid_list, out_q: "queue.Queue[tuple[int, list[int], list[float]]]"):
                     weights_logger.info("=== Weight computation start | block %s ===", block_snapshot)
                     pt.update_plaintext(miner_data)
+
+                    try:
+                        horizon = min(
+                            len(rec["embeddings"])
+                            for rec in plaintext_miner_data.values()
+                            if isinstance(rec.get("embeddings"), list) and rec["embeddings"]
+                        )
+                    except ValueError:
+                        horizon = 0
+
+                    if horizon < config.LAG + 1:
+                        weights_logger.info(
+                            "Plaintext horizon too short (%d < %d) – deferring salience",
+                            horizon,
+                            config.LAG + 1,
+                        )
+                        return
 
                     min_hist_len = min(
                         (
@@ -269,29 +290,17 @@ def main():
                         weights_logger.warning("Zero-sum weights at block %s – skip", block_snapshot)
                         return
 
-                    w = w / w.sum()
-                    try:
-                        sub.set_weights(
-                            netuid=netuid,
-                            wallet=wallet,
-                            uids=uid_list,
-                            weights=w,
-                            wait_for_inclusion=False,
-                        )
-                        weights_logger.info(
-                            "✓ set_weights submitted at block %s (max=%.4f)",
-                            block_snapshot,
-                            w.max(),
-                        )
-                    except Exception as e:
-                        if "RateLimit" in str(e):
-                            weights_logger.warning("Rate limit exceeded – delaying next weight update by 30s")
-                            time.sleep(30)
-                        weights_logger.exception("set_weights failed at block %s: %s", block_snapshot, e)
-                    finally:
-                        weights_logger.info("=== Weight computation end | block %s ===", block_snapshot)
+                    w = (w / w.sum()).cpu().tolist()
 
-                weight_thread = threading.Thread(target=worker, args=(blk, mg.uids), daemon=True)
+                    out_q.put((block_snapshot, [int(u) for u in uid_list], w))
+                    weights_logger.info(
+                        "✓ Weights computed and queued at block %s (max=%.4f)",
+                        block_snapshot,
+                        max(w),
+                    )
+                    weights_logger.info("=== Weight computation end | block %s ===", block_snapshot)
+
+                weight_thread = threading.Thread(target=worker, args=(blk, mg.uids, weight_queue), daemon=True)
                 weight_thread.start()
                 next_task = blk + config.TASK_INTERVAL
 
@@ -299,6 +308,30 @@ def main():
 
             if blk % 30 == 0:
                 pt.save_plaintext()
+
+            try:
+                while True:
+                    blk_snap, uid_list_queued, w_list = weight_queue.get_nowait()
+                    w_tensor = torch.tensor(w_list, dtype=torch.float32)
+                    try:
+                        sub.set_weights(
+                            netuid=netuid,
+                            wallet=wallet,
+                            uids=uid_list_queued,
+                            weights=w_tensor,
+                            wait_for_inclusion=False,
+                        )
+                        weights_logger.info(
+                            "✓ set_weights submitted from queue (blk=%s, max=%.4f)",
+                            blk_snap,
+                            w_tensor.max(),
+                        )
+                    except Exception as e:
+                        weights_logger.exception("Failed to set queued weights at block %s: %s", blk_snap, e)
+                    finally:
+                        weight_queue.task_done()
+            except queue.Empty:
+                pass
 
             last_block = blk
         time.sleep(2)
