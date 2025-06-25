@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import ast
@@ -16,12 +15,10 @@ log = logging.getLogger("plaintext")
 
 PLAINTEXT_PATH = os.path.expanduser("~/plaintext.data.gz")
 
-# Structure: plaintext_miner_data[uid] = {"embeddings": list[list[float]], "returns": list[float]}
 plaintext_miner_data: Dict[int, Dict[str, List[Any]]] = {}
 
 
 def load_plaintext() -> None:
-    """Populate `plaintext_miner_data` from PLAINTEXT_PATH if it exists."""
     if not os.path.exists(PLAINTEXT_PATH):
         return
     try:
@@ -39,7 +36,6 @@ def load_plaintext() -> None:
 
 
 def save_plaintext() -> None:
-    """Write current plaintext_miner_data to PLAINTEXT_PATH (gzip compressed)."""
     try:
         payload = json.dumps(plaintext_miner_data, separators=(",", ":")).encode()
         with gzip.open(PLAINTEXT_PATH + ".tmp", "wb", compresslevel=5) as f:
@@ -65,9 +61,7 @@ def _dbytes(x):
 
 
 def update_plaintext(miner_data: Dict[int, Any]) -> None:
-    """Ensure plaintext_miner_data contains decrypted data for every UID up to
-    `horizon = min_hist_len - config.LAG`.
-    """
+
     N = config.NUM_UIDS
     D = config.FEATURE_LENGTH
     LAG = config.LAG
@@ -77,9 +71,8 @@ def update_plaintext(miner_data: Dict[int, Any]) -> None:
     ]
     if not active_lengths:
         return
-    horizon = min(active_lengths) - LAG
-    if horizon <= 0:
-        return
+
+    horizon = max(active_lengths)  
 
     for uid in range(N):
         hist = miner_data.get(uid, {}).get("history")
@@ -96,7 +89,7 @@ def update_plaintext(miner_data: Dict[int, Any]) -> None:
             continue
 
         for t in range(start, horizon):
-            enc = hist[t]
+            enc = hist[t] if t < len(hist) else ZERO_VEC
             if isinstance(enc, list) and len(enc) == D:
                 vec = enc
             else:
@@ -115,17 +108,16 @@ def update_plaintext(miner_data: Dict[int, Any]) -> None:
                         pass
             emb_out.append(vec)
             try:
-                p, f = btc[t], btc[t + LAG]
-                r = (f - p) / p if p else 0.0
+                if t < len(btc) and t + LAG < len(btc):
+                    p, f = btc[t], btc[t + LAG]
+                    r = (f - p) / p if p else 0.0
+                else:
+                    r = 0.0
             except Exception:
                 r = 0.0
             ret_out.append(r)
 
-        if len(emb_out) > horizon:
-            emb_out[:] = emb_out[:horizon]
-            ret_out[:] = ret_out[:horizon]
-
-    log.info("Plaintext update complete up to horizon %d", horizon)
+    log.info("Plaintext update complete up to horizon %d (max mode, no truncation)", horizon)
 
 
 
@@ -140,29 +132,36 @@ def compute_salience_from_plaintext(sal_fn):
     N = config.NUM_UIDS
     LAG = config.LAG
 
-    horizons = []
-    for uid in range(N):
-        rec = plaintext_miner_data.get(uid)
-        if rec and isinstance(rec.get("embeddings"), list):
-            horizons.append(len(rec["embeddings"]))
-    if not horizons:
+    lens = [len(rec["embeddings"]) for rec in plaintext_miner_data.values() if isinstance(rec.get("embeddings"), list)]
+    if not lens:
         return None
 
-    T = min(horizons)
+    max_T = max(lens)
+    if max_T <= 0:
+        return None
+
+    ret_src = plaintext_miner_data.get(1)
+    if not ret_src or not isinstance(ret_src.get("returns"), list):
+        return None
+
+    btc_len = len(ret_src["returns"])
+    T = min(max_T, btc_len)
     if T <= 0:
         return None
 
-    history: Dict[int, List[List[float]] | None] = {}
+    history: Dict[int, List[List[float]]] = {}
     for uid in range(N):
         rec = plaintext_miner_data.get(uid)
-        if rec and isinstance(rec.get("embeddings"), list) and len(rec["embeddings"]) >= T:
-            history[uid] = rec["embeddings"][:T]
+        if rec and isinstance(rec.get("embeddings"), list):
+            emb = rec["embeddings"]
+            L = len(emb)
+            if L >= T:
+                history[uid] = emb[:T]
+            else:
+                pad_len = T - L
+                history[uid] = [ZERO_VEC] * pad_len + emb
         else:
-            history[uid] = None 
-
-    ret_src = plaintext_miner_data.get(1)
-    if not ret_src or len(ret_src.get("returns", [])) < T:
-        return None
+            history[uid] = [ZERO_VEC] * T
 
     pct = ret_src["returns"][:T]
 
