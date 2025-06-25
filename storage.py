@@ -236,7 +236,7 @@ class DataLog:
         BTC price returns based on the `LAG` constant. It ensures all data is
         aligned and correctly formatted for the model.
         """
-        if not self.plaintext_cache or len(self.blocks) < config.LAG + 1:
+        if not self.plaintext_cache or len(self.blocks) < config.LAG * 2 + 1:
             logger.warning("Not enough data to create a training set.")
             return None
 
