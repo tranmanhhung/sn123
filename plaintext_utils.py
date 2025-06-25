@@ -20,27 +20,42 @@ log = logging.getLogger("plaintext")
 
 PLAINTEXT_PATH = os.path.expanduser("~/plaintext.data.gz")
 
+# Global lock for plaintext_miner_data
 plaintext_lock = threading.Lock()
 
 plaintext_miner_data: Dict[int, Dict[str, List[Any]]] = {}
 
 
 def load_plaintext() -> None:
-    """Populate `plaintext_miner_data` from PLAINTEXT_PATH if it exists."""
+    """Load the plaintext data from disk if it exists."""
     if not os.path.exists(PLAINTEXT_PATH):
         return
+    log = logging.getLogger("plaintext")
+    log.info("Loading plaintext data from %s", PLAINTEXT_PATH)
     try:
         with gzip.open(PLAINTEXT_PATH, "rb") as f:
-            data = json.loads(f.read().decode())
+            obj = json.load(f)
+        
         plaintext_miner_data.clear()
-        for k, v in data.items():
+        for k, v in obj.items():
             try:
-                plaintext_miner_data[int(k)] = v
-            except Exception:
-                pass
-        log.info("Loaded plaintext embeddings for %d UIDs", len(plaintext_miner_data))
+                uid = int(k)
+                # handle legacy formats and ensure all keys are present
+                if not isinstance(v, dict): 
+                    v = {"embeddings": v} # very old format was just a list of embeddings
+                
+                v.setdefault("embeddings", [])
+                v.setdefault("blocks", [])
+                v.setdefault("btc", [])
+                v.pop("returns", None) # remove legacy field
+
+                _hex_to_bytes(v)
+                plaintext_miner_data[uid] = v
+            except (ValueError, TypeError):
+                continue
+        log.info("✓ Loaded plaintext data for %d UIDs", len(plaintext_miner_data))
     except Exception as e:
-        log.warning("Failed to load plaintext archive: %s", e)
+        log.warning("Failed to load plaintext data: %s", e)
 
 
 def save_plaintext() -> None:
@@ -123,7 +138,7 @@ def update_plaintext(miner_data: dict) -> None:
     with plaintext_lock:
         log = logging.getLogger("plaintext")
         log.info("--- Starting parallel plaintext update ---")
-        t0 = time.time()
+        t0 = time.perf_counter()
         
         decrypted_count = 0
         
@@ -170,10 +185,15 @@ def update_plaintext(miner_data: dict) -> None:
                     pt_record["btc"].extend(new_btc)
                     
                     decrypted_count += len(new_embeddings)
+
+                    if new_embeddings:
+                        latest_embedding = new_embeddings[-1]
+                        log.info(f"UID {uid}: latest decrypted embedding sample: {str(latest_embedding[:5])[:-1]}...]")
+
                 except Exception as exc:
                     log.error(f"UID {uid} generated an exception during parallel decryption: {exc}")
 
-        log.info(f"--- Finished plaintext update. Decrypted {decrypted_count} new records in {time.time() - t0:.2f}s ---")
+        log.info(f"--- Finished plaintext update. Decrypted {decrypted_count} new records in {time.perf_counter() - t0:.4f}s ---")
 
 
 def compute_salience_from_plaintext(salience_fn, max_horizon: int | None = None) -> list[float] | None:
@@ -188,34 +208,45 @@ def compute_salience_from_plaintext(salience_fn, max_horizon: int | None = None)
     lens = [len(rec["embeddings"]) for rec in local_plaintext_data.values() if isinstance(rec.get("embeddings"), list)]
     if not lens:
         return None
+    
+    T = min(lens)
+    if max_horizon is not None:
+        T = min(T, max_horizon)
 
-    max_T = max(lens)
-    if max_T <= 0:
+    if T <= LAG:
+        logging.getLogger("plaintext").warning("Not enough history for salience (T=%d <= LAG=%d)", T, LAG)
         return None
 
-    ret_src = local_plaintext_data.get(1)
-    if not ret_src or not isinstance(ret_src.get("returns"), list):
+    # Get BTC prices from any UID that has them (they are all the same)
+    btc_prices = None
+    for rec in local_plaintext_data.values():
+        if isinstance(rec.get("btc"), list) and len(rec["btc"]) >= T:
+            btc_prices = rec["btc"]
+            break
+    
+    if btc_prices is None:
+        logging.getLogger("plaintext").warning("Not enough BTC price data for salience, returning None.")
         return None
 
-    btc_len = len(ret_src["returns"])
-    T = min(max_T, btc_len)
-    if T <= 0:
-        return None
+    # Calculate percentage returns
+    returns = []
+    for t in range(T - LAG):
+        try:
+            p, f = btc_prices[t], btc_prices[t + LAG]
+            r = (f - p) / p if p else 0.0
+        except (IndexError, ZeroDivisionError):
+            r = 0.0
+        returns.append(r)
+    
+    T_returns = len(returns)
 
     history = defaultdict(list)
-    returns = defaultdict(list)
-
     for uid in range(N):
         rec = local_plaintext_data.get(uid)
-        if not rec or not isinstance(rec.get("embeddings"), list):
-            continue
-        history[uid] = rec["embeddings"][:T]
-        if not rec or not isinstance(rec.get("btc"), list):
-            continue
-        
-        btc_prices = rec["btc"]
-        T_returns = min(len(btc_prices) - LAG, T)
+        if rec and isinstance(rec.get("embeddings"), list) and len(rec["embeddings"]) >= T_returns:
+            history[uid] = rec["embeddings"][:T_returns]
+        else:
+            # Pad if not enough history
+            history[uid] = [ZERO_VEC] * T_returns
 
-    pct = ret_src["returns"][:T]
-
-    return salience_fn(history, pct) 
+    return salience_fn(history, returns) 
