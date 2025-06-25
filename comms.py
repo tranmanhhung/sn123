@@ -195,27 +195,28 @@ async def download(url: str, max_size_bytes: int | None = None):
 
         async with s.get(url, timeout=600) as r:
             r.raise_for_status()
+            
+            # Always read the raw body first for maximum reliability.
+            body = await r.read()
             try:
-                data = await r.json()
-            except Exception:
-                try:
-                    data_bytes = await r.read()
-                    try:
-                        data = data_bytes.decode()
-                    except Exception:
-                        data = data_bytes
-                except Exception:
-                    data = None
+                # Attempt to decode as text and then parse as JSON. This is
+                # the most common case for our payloads.
+                data = json.loads(body.decode('utf-8'))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # If it's not valid JSON or not valid UTF-8, it's some other
+                # binary format. Return the raw bytes.
+                data = body
 
+    # The local caching logic handles both dicts (from JSON) and bytes.
     try:
-        if isinstance(data, (dict, list, str, int, float, bool, type(None))):
-            with open(path, "w") as f:
+        if isinstance(data, (dict, list)):
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-        else:
+        elif isinstance(data, bytes):
             with open(path, "wb") as f:
-                f.write(data if isinstance(data, (bytes, bytearray)) else bytes(str(data), "utf-8"))
+                f.write(data)
     except Exception:
-        pass
+        pass # Fail silently on cache write errors.
     return data
 
 

@@ -1,11 +1,14 @@
- MANTIS Bittensor Subnet Validator – Core Overview
+# MANTIS Bittensor Subnet Validator – Core Overview
 
 ## Purpose
-A lean **validator** for Bittensor subnet **123** that ranks miners broadcasting time-locked Bitcoin-price embeddings.  The validator:
+A lean, performant **validator** for Bittensor subnet **123**. It is designed to evaluate and rank miners who broadcast time-locked embeddings that predict Bitcoin price movements.
 
-1. Collects encrypted embeddings from miners every block.
-2. Caches all raw data to Cloudflare R2 for transparency.
-3. Estimates **salience** – the marginal predictive power of each miner – with a proxy model.
+The validator's core responsibilities are to:
+
+1.  **Collect** encrypted data payloads from all active miners at regular intervals.
+2.  **Securely Decrypt** the payloads using a decentralized timelock mechanism (`tlock`) powered by the Drand network.
+3.  **Calculate Salience** by estimating the marginal predictive power of each miner's data using a lightweight proxy model.
+4.  **Set Weights** on the Bittensor blockchain, rewarding miners proportional to their contribution.
 
 ---
 
@@ -13,77 +16,102 @@ A lean **validator** for Bittensor subnet **123** that ranks miners broadcasting
 
 ```mermaid
 graph TD
-    A["Blockchain (Subtensor)"] -->|"commitments"| B(cycle.py)
-    B -->|"data snapshots"| C["memory: miner_data"]
-    C -->|"training data"| D(model.py)
-    D -->|"salience scores"| E(main.py)
-    E -->|"set_weights"| A
-    C -->|"gzip archive"| F["Cloudflare R2 (comms.py)"]
-```
+    subgraph "main.py (Orchestrator)"
+        direction LR
+        A["On Sampled Block"] --> B{cycle.py};
+        B -->|Raw Payloads| C["datalog.append_step()"];
+        A --> D["Periodic Checks"];
+        D --> E["datalog.process_pending_payloads()"];
+        D --> F["datalog.get_training_data()"];
+        F --> G["model.salience()"];
+        G --> H["sub.set_weights()"];
+    end
+    
+    subgraph "storage.py (State)"
+        I[DataLog Object]
+    end
 
+    subgraph "External Services"
+        J["Miners (R2 Buckets)"]
+        K["Drand Beacon"]
+        L["Bittensor Subtensor"]
+    end
+
+    C --> I;
+    E --> I;
+    F -- Reads from --> I;
+    B -- Downloads from --> J;
+    E -- Fetches Signatures --> K;
+    H -- Writes to --> L;
+    B -- Reads Commitments --> L;
+```
 
 ## Core Modules
 
-1. **`config.py`** – Single source-of-truth for tunable constants (e.g. `NUM_UIDS`, `FEATURE_LENGTH`, `LAG`, `TASK_INTERVAL`).
-2. **`comms.py`** – Bidirectional I/O with Cloudflare R2.  Provides a local disk cache and simple upload/download helpers.
-3. **`cycle.py`** – Ingests on-chain commitments, fetches BTC/USDT spot price, and appends `(ciphertext, block, price)` tuples to the global `miner_data` structure.
-4. **`model.py`** – Lightweight MLP used to compute per-miner salience via a leave-one-out loss delta.
-5. **`main.py`** – Top-level orchestrator.  Runs an infinite loop that (i) calls `cycle()` every block and (ii) recomputes & submits weights every `TASK_INTERVAL` blocks.
-
-> **Note** Only the above five files are required for end-to-end operation.  All other scripts in the repository are auxiliary and *not* used by the live validator.
+1.  **`config.py`** – A single source of truth for tunable constants like `NETUID`, `FEATURE_LENGTH`, and `LAG`.
+2.  **`main.py`** – The top-level orchestrator. It runs an infinite loop that is driven by the blockchain's block height, orchestrating all data collection, processing, and weight-setting tasks at their specified intervals.
+3.  **`storage.py`** – The heart of the system. It contains the `DataLog` class, which manages all historical state, including the plaintext cache and the queue of raw payloads. It is responsible for data integrity, persistence, and the entire `tlock` decryption workflow.
+4.  **`cycle.py`** – A stateless utility responsible for fetching the current set of miner commitments from the subtensor and downloading their corresponding raw payloads.
+5.  **`model.py`** – A lightweight MLP used to compute per-miner salience via a leave-one-out loss delta method.
+6.  **`comms.py`** – Handles all asynchronous network download operations.
 
 ---
 
 ## Data Structure
 
+The validator's entire state is encapsulated within the `DataLog` object, defined in `storage.py`. This makes the system portable and easy to manage.
+
 ```python
-miner_data: Dict[int, {
-    'uid':      int,
-    'hotkey':   str | None,
-    'history':  List[bytes | str],  # encrypted embeddings
-    'object_url': str | None,       # R2 link advertised on-chain
-    'blocks':   List[int],          # block heights when data was seen
-    'btc':      List[float],        # spot price at the same height
-}]
+class DataLog:
+    # Timestamps and reference prices
+    blocks:         List[int]
+    btc_prices:     List[float]
+    
+    # Decrypted, model-ready data
+    plaintext_cache: List[Dict[int, List[float]]]
+    
+    # Queue of unprocessed encrypted payloads
+    raw_payloads:   Dict[int, Dict[int, bytes]]
 ```
 
 ---
 
 ## End-to-End Workflow
 
-1. **Initialisation** – `main.py` optionally restores `miner_data` from the last published R2 archive and connects to the network.
-2. **Collection (every block)** – `cycle.py` mirrors new commitments into memory and updates the BTC reference price.
-3. **Evaluation (every `TASK_INTERVAL` blocks)** – Salience is recomputed; weights are normalised and submitted via `subtensor.set_weights()`.
-4. **Reward Distribution** – Miners receive Bittensor emissions proportional to their latest weight.
+1.  **Initialisation** – On startup, `main.py` loads the entire `DataLog` object from a local file (`mantis_datalog.pkl.gz`). If the file doesn't exist, it attempts to bootstrap its state by downloading it from the public archive URL in `config.py`.
+2.  **Collection (every `SAMPLE_STEP` blocks)** – `main.py` calls `cycle.py` to fetch all miner payloads and appends the new data to the `DataLog`.
+3.  **Decryption (every `PROCESS_INTERVAL` blocks)** – `main.py` triggers `datalog.process_pending_payloads()`, which finds all payloads that are now old enough to be unlocked, fetches the required Drand signatures, and decrypts them in parallel batches.
+4.  **Evaluation (every `TASK_INTERVAL` blocks)** – A background thread calls `datalog.get_training_data()` to get the latest model-ready data, computes salience scores, normalizes them, and submits the new weights to the subtensor.
 
 ---
 
 ## Security Highlights
 
-• **Time-lock encryption** prevents miners from plagiarising peer embeddings.
-• **Hotkey continuity check** resets history if a miner rotates keys (sybil defence).
-• **Payload size limits** mitigate denial-of-service via oversized objects.
+-   **Decentralized Time-lock:** Uses `tlock` and the public Drand randomness beacon, ensuring that data is verifiably locked without relying on any single party or blockchain state.
+-   **Commit Validation:** The validator verifies that the filename in a miner's commit URL matches their hotkey, preventing one miner from pointing to another's data.
+-   **Data Validation:** All decrypted payloads are strictly validated. Any data that is malformed (wrong length, values out of range) is safely discarded and replaced with a neutral zero vector.
+-   **Payload Size Limits:** `comms.py` enforces a maximum download size to mitigate denial-of-service attacks.
 
 ---
 
 ## Dependencies
 
-- `bittensor` – Blockchain client & time-lock cryptography.
-- `torch` – Neural-network backbone.
-- `requests`, `aiohttp` – HTTP I/O (sync & async).
-- `aiobotocore`, `boto3` – Cloudflare R2 S3 compatibility.
-- `numpy`, `pandas` – Numeric utilities.
+The system's core dependencies are managed in `requirements.txt`. Key libraries include:
+-   `bittensor`
+-   `torch`
+-   `timelock`
+-   `requests`, `aiohttp`
 
 ---
 
 ## Extensibility
 
-- Swap in an alternative salience algorithm by editing **`model.py`** only.
-- Use a different storage backend by replacing functions in **`comms.py`**.
-- Increase embedding dimensionality via `FEATURE_LENGTH`; the model adapts automatically.
+-   Swap in an alternative salience algorithm by editing **`model.py`** only.
+-   Change the data storage and processing logic by editing **`storage.py`**.
+-   Increase embedding dimensionality by changing `FEATURE_LENGTH` in `config.py`.
 
 ---
 
 ## License
 
-Released under the MIT License © 2024 MANTIS.
+Released under the MIT License © 2024 MANTIS. 

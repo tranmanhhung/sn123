@@ -21,175 +21,70 @@
 # THE SOFTWARE.
 
 import asyncio, bittensor as bt, requests, config, comms, logging, os
-from plaintext_utils import plaintext_miner_data, ZERO_VEC
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
 NETWORK = "finney"
 sub = bt.subtensor(network=NETWORK)
-miner_data: dict[int, dict] = {}
 
 MAX_PAYLOAD_BYTES = 25 * 1024 * 1024
 
-ZERO_CIPHER = bt.timelock.encrypt(str([0] * config.FEATURE_LENGTH), n_blocks=1, block_time=1)[0]
+def get_miner_payloads(
+    netuid: int = 123, mg: bt.metagraph = None
+) -> dict[int, bytes]:
+    """
+    Fetches the current block's payloads from all active miners.
 
-def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
-    ref = sub.get_timestamp(block)
-    price = float(requests.get("https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT",timeout=2).json()["price"])
+    This function is now stateless. It queries the subtensor for miner commitments
+    and downloads the corresponding payloads, returning a simple dictionary
+    mapping UID to the raw payload bytes. All state management is handled by the
+    DataLog.
 
+    Returns:
+        A dictionary mapping miner UIDs to their payload bytes.
+    """
+    if mg is None:
+        mg = bt.metagraph(netuid=netuid, network=NETWORK, sync=True)
     
     commits = sub.get_all_commitments(netuid)
-    logger.debug("commits %s", commits)
-
     uid2hot = dict(zip(mg.uids.tolist(), mg.hotkeys))
-    logger.debug("uid2hot mapping ready")
-    zero = ZERO_CIPHER 
+    payloads = {}
 
-    async def task(uid: int):
-        """Fetch payload for a single UID.
-        For miners that have **never** committed, we leave ``history`` as ``None`` until
-        their first valid commit arrives. When that happens, the entire backfill of
-        zeros (encrypted) is generated in one shot so that their history length
-        matches the current global length.
-        """
+    async def _fetch_one(uid: int):
+        hotkey = uid2hot.get(uid)
+        object_url = commits.get(hotkey) if hotkey else None
+        if not object_url:
+            return
+
         try:
-            hot = uid2hot.get(uid)
-            prev = miner_data.get(uid, {})
-
-            hist = prev.get("history") 
-            blocks = prev.get("blocks") or []
-            btc = prev.get("btc") or []
-
-            if isinstance(hist, list) and prev.get("hotkey") != hot:
-                hist = [zero] * len(hist)
-                blocks = blocks[: len(hist)]
-                btc = btc[: len(hist)]
-
-                try:
-                    entry = plaintext_miner_data.get(uid)
-                    if entry and isinstance(entry.get("embeddings"), list):
-                        n = len(entry["embeddings"])
-                        entry["embeddings"] = [ZERO_VEC] * n
-                except Exception as e:
-                    logger.warning("Failed to reset plaintext embeddings for UID %s after hotkey change: %s", uid, e)
-
-            object_url = commits.get(hot) if hot else None
-
-
-            if object_url is None and not isinstance(hist, list):
-                miner_data[uid] = {
-                    "uid": uid,
-                    "hotkey": hot,
-                    "history": None,
-                    "object_url": None,
-                    "blocks": None,
-                    "btc": None,
-                }
+            path_parts = urlparse(object_url).path.lstrip("/").split("/")
+            object_name = path_parts[-1] if path_parts else ""
+            if object_name.lower() != (hotkey or "").lower():
+                logger.warning(
+                    f"UID {uid} commit URL {object_url} does not match hotkey {hotkey}"
+                )
                 return
+        except Exception:
+            return
 
-            payload = zero 
-
-            if object_url is not None:
-                try:
-                    from urllib.parse import urlparse
-
-                    path_parts = urlparse(object_url).path.lstrip("/").split("/")
-                    object_name = path_parts[-1] if path_parts else ""
-
-                    if object_name.lower() == (hot or "").lower():
-                        try:
-                            payload_raw = await comms.download(object_url, max_size_bytes=MAX_PAYLOAD_BYTES)
-                        except Exception as e:
-                            logger.warning("Download failed for uid %s: %s", uid, e)
-                            payload_raw = None
-
-                        if payload_raw is not None:
-                            payload = payload_raw
-                        else:
-                            logger.warning("Rejected payload for uid %s: invalid or too large", uid)
-                except Exception as e:
-                    logger.warning("Error processing payload for uid %s: %s", uid, e)
-
-            if not isinstance(hist, list):
-                current_len = next((len(r["history"]) for r in miner_data.values() if isinstance(r.get("history"), list)), 0)
-                hist = [zero] * current_len
-                blocks = [block] * current_len
-                btc = [price] * current_len
-
-            hist.append(payload)
-            blocks.append(block)
-            btc.append(price)
-
-            miner_data[uid] = {
-                "uid": uid,
-                "hotkey": hot,
-                "history": hist,
-                "object_url": object_url,
-                "blocks": blocks,
-                "btc": btc,
-            }
+        try:
+            payload_raw = await comms.download(object_url, max_size_bytes=MAX_PAYLOAD_BYTES)
+            if payload_raw:
+                payloads[uid] = payload_raw
         except Exception as e:
-            logger.exception("Unhandled error in task(uid=%s): %s", uid, e)
-            miner_data[uid] = {
-                "uid": uid,
-                "hotkey": uid2hot.get(uid),
-                "history": None,
-                "object_url": None,
-                "blocks": None,
-                "btc": None,
-            }
+            logger.warning(f"Download failed for UID {uid} at {object_url}: {e}")
 
-    async def run():
-        await asyncio.gather(*(task(u) for u in range(config.NUM_UIDS)), return_exceptions=True)
-
-        ref_len = 0
-        for rec in miner_data.values():
-            hist = rec.get("history")
-            if isinstance(hist, list) and len(hist) > ref_len:
-                ref_len = len(hist)
-
-        for uid in range(config.NUM_UIDS):
-            rec = miner_data.get(uid)
-            if rec is None:
-                miner_data[uid] = {
-                    "uid": uid,
-                    "hotkey": uid2hot.get(uid),
-                    "history": None,
-                    "object_url": None,
-                    "blocks": None,
-                    "btc": None,
-                }
-                continue
-
-            hist = rec.get("history")
-            if not isinstance(hist, list):
-                continue
-
-            while len(hist) < ref_len:
-                hist.append(zero)
-                rec["blocks"].append(block)
-                rec["btc"].append(price)
-        logger.debug("Cycle verification complete – all UIDs padded to length %s", ref_len)
+    async def _run():
+        await asyncio.gather(*(
+            _fetch_one(int(u)) for u in mg.uids
+        ), return_exceptions=True)
 
     try:
-        asyncio.run(run())
+        asyncio.run(_run())
     except RuntimeError:
-        asyncio.get_event_loop().run_until_complete(run())
+        asyncio.get_event_loop().run_until_complete(_run())
 
-
-    committed = 0
-    valid = 0
-    for uid in range(config.NUM_UIDS):
-        hot = uid2hot.get(uid)
-        if commits.get(hot):
-            committed += 1
-            try:
-                hist = miner_data[uid].get("history")
-                if isinstance(hist, list) and hist and hist[-1] != ZERO_CIPHER:
-                    valid += 1
-            except Exception:
-                pass
-
-    return {"committed": committed, "valid": valid}
+    return payloads
 
 
