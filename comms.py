@@ -32,6 +32,7 @@ import aiohttp, email.utils
 import base64
 from pathlib import Path
 from botocore.client import Config
+import re
 
 
 # Module logger
@@ -136,12 +137,62 @@ async def _local_path_from_url(url: str) -> str:
     name = url.split("://", 1)[1]
     return os.path.join(os.path.expanduser("~/storage"), name)
 
-async def download(url: str):
+async def _object_size(url: str, session: aiohttp.ClientSession, timeout: int = 10) -> int | None:
+    """Return object size in bytes using HEAD or Range request, or None."""
+    try:
+        # HEAD first – many servers include Content-Length here.
+        async with session.head(url, timeout=timeout, headers={"Accept-Encoding": "identity"}) as r:
+            if r.status == 200:
+                cl = r.headers.get("Content-Length")
+                if cl and cl.isdigit():
+                    return int(cl)
+        # Fallback: Range 0-0 GET to retrieve Content-Range header.
+        async with session.get(url, timeout=timeout, headers={
+            "Accept-Encoding": "identity",
+            "Range": "bytes=0-0",
+        }) as r:
+            if r.status in (200, 206):
+                cr = r.headers.get("Content-Range")
+                if cr:
+                    m = re.match(r"bytes \d+-\d+/(\d+)", cr)
+                    if m:
+                        return int(m.group(1))
+    except Exception:
+        # Any failure → size unknown
+        return None
+    return None
+
+async def download(url: str, max_size_bytes: int | None = None):
+    """Download object at URL and cache to ~/storage.
+
+    Parameters
+    ----------
+    url : str
+        HTTP(S) location to download.
+    max_size_bytes : int | None
+        Optional hard ceiling in bytes. If provided, the function first
+        issues a lightweight HEAD/Range request to obtain the object size and
+        **skips the download** (raising ``ValueError``) when that size exceeds
+        the limit. This prevents accidental OOM on gigantic or malicious
+        payloads.
+    """
 
     path = await _local_path_from_url(url)
     os.makedirs(os.path.dirname(path), exist_ok=True)
 
     async with aiohttp.ClientSession() as s:
+        # ------------------------------------------------------------------
+        # Optional size pre-check – avoids downloading huge payloads.
+        # ------------------------------------------------------------------
+        if max_size_bytes is not None and max_size_bytes > 0:
+            try:
+                sz = await _object_size(url, s)
+                if sz is not None and sz > max_size_bytes:
+                    raise ValueError(f"Object size {sz} exceeds limit {max_size_bytes}")
+            except Exception as e:
+                logger.warning("Size check failed for %s: %s", url, e)
+                raise
+
         async with s.get(url, timeout=600) as r:
             r.raise_for_status()
             try:
