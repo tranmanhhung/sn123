@@ -21,6 +21,7 @@
 # THE SOFTWARE.
 
 import asyncio, bittensor as bt, requests, config, comms, logging, os
+from plaintext_utils import plaintext_miner_data, ZERO_VEC
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,14 @@ def cycle(netuid: int = 123, block: int = None, mg: bt.metagraph = None):
                 hist = [zero] * len(hist)
                 blocks = blocks[: len(hist)]
                 btc = btc[: len(hist)]
+
+                try:
+                    entry = plaintext_miner_data.get(uid)
+                    if entry and isinstance(entry.get("embeddings"), list):
+                        n = len(entry["embeddings"])
+                        entry["embeddings"] = [ZERO_VEC] * n
+                except Exception as e:
+                    logger.warning("Failed to reset plaintext embeddings for UID %s after hotkey change: %s", uid, e)
 
             object_url = commits.get(hot) if hot else None
 
