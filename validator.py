@@ -135,7 +135,7 @@ def main():
             datalog.append_step(current_block, price, payloads)
 
             # --- Process pending payloads ---
-            if current_block >= next_process and len(datalog.blocks) >= 400:
+            if current_block >= next_process and len(datalog.blocks) >= 70:
                 logging.info("Decrypting and processing pending payloads...")
                 asyncio.run(datalog.process_pending_payloads())
                 next_process = current_block + PROCESS_INTERVAL
