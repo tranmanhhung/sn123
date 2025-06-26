@@ -72,8 +72,8 @@ class MinerConfig:
     
     @property 
     def r2_public_url(self) -> str:
-        # Use existing bucket with hotkey as object key
-        return f"https://pub-09f5de84cf104b3f8ce32bb6b2d774f9.r2.dev/miner-c8-h1/{self.hotkey}"
+        # Correct public URL format (direct object access)
+        return f"https://pub-09f5de84cf104b3f8ce32bb6b2d774f9.r2.dev/{self.hotkey}"
     
     @property
     def r2_bucket_name(self) -> str:
