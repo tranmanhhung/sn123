@@ -101,15 +101,27 @@ class DataLog:
 
     async def _get_drand_signature(self, round_num: int) -> bytes | None:
         """Fetches the signature for a specific Drand round."""
+        # Add a small buffer to give the beacon time to publish.
+        await asyncio.sleep(2)
         try:
             url = f"{DRAND_API}/beacons/{DRAND_BEACON_ID}/rounds/{round_num}"
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=3) as response:
+                async with session.get(url, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
+                        logger.debug(f"✅ Signature fetched for round {round_num}")
                         return bytes.fromhex(data["signature"])
-                    return None
-        except Exception:
+                    else:
+                        logger.warning(
+                            f"-> Failed to fetch signature for round {round_num}, "
+                            f"status: {response.status}"
+                        )
+                        return None
+        except asyncio.TimeoutError:
+            logger.warning(f"-> Timeout fetching signature for round {round_num}")
+            return None
+        except Exception as e:
+            logger.error(f"-> Error fetching signature for round {round_num}: {e}")
             return None
 
     def append_step(
@@ -175,7 +187,8 @@ class DataLog:
         processed_payload_keys: List[tuple[int, int]] = []
 
         # 1. Group payloads by Drand round
-        for ts, payloads_at_step in self.raw_payloads.items():
+        # Iterate over a copy of the items to prevent mutation issues during the loop.
+        for ts, payloads_at_step in list(self.raw_payloads.items()):
             block_age = current_block - self.blocks[ts]
             if not (61 <= block_age <= 120):
                 if block_age > 120:
@@ -183,9 +196,15 @@ class DataLog:
                     processed_payload_keys.extend([(ts, u) for u in payloads_at_step.keys()])
                 continue
 
-            for uid, payload_bytes in payloads_at_step.items():
+            for uid, payload_bytes in list(payloads_at_step.items()):
                 try:
-                    p = json.loads(payload_bytes)
+                    # Ensure we are working with bytes
+                    if isinstance(payload_bytes, dict):
+                        # This is a corrupted entry from a previous bug, convert it back for processing
+                        p = payload_bytes
+                    else:
+                        p = json.loads(payload_bytes)
+
                     round_num = p["round"]
                     if round_num not in rounds_to_process:
                         rounds_to_process[round_num] = []
