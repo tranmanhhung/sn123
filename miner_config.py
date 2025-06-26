@@ -38,8 +38,9 @@ class MinerConfig:
     r2_access_key_id: Optional[str] = None
     r2_secret_access_key: Optional[str] = None
     
-    # Market Data Settings
+    # Market Data Settings - Multiple endpoints for geo-restrictions
     binance_api_base: str = "https://api.binance.com/api/v3"
+    binance_api_alternatives: list = None
     coingecko_api_base: str = "https://api.coingecko.com/api/v3"
     
     # ML Model Settings
@@ -51,6 +52,16 @@ class MinerConfig:
         self.r2_account_id = os.getenv("R2_ACCOUNT_ID")
         self.r2_access_key_id = os.getenv("R2_WRITE_ACCESS_KEY_ID") 
         self.r2_secret_access_key = os.getenv("R2_WRITE_SECRET_ACCESS_KEY")
+        
+        # Setup alternative Binance endpoints for geo-restrictions
+        self.binance_api_alternatives = [
+            "https://api.binance.com/api/v3",
+            "https://api1.binance.com/api/v3", 
+            "https://api2.binance.com/api/v3",
+            "https://api3.binance.com/api/v3",
+            "https://api.binance.us/api/v3",  # US endpoint
+            "https://fapi.binance.com/fapi/v1",  # Futures API (sometimes less restricted)
+        ]
         
         if not all([self.r2_account_id, self.r2_access_key_id, self.r2_secret_access_key]):
             raise ValueError("Missing R2 credentials in environment variables")

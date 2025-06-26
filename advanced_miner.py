@@ -30,7 +30,7 @@ from timelock import Timelock
 
 # Import our custom modules
 from miner_config import config
-from market_data import fetch_comprehensive_market_data
+from market_data_fallback import fetch_comprehensive_market_data
 from ml_predictor import predictor
 from miner_monitoring import monitor
 
@@ -168,14 +168,16 @@ class AdvancedMiner:
                 monitor.logger.error("Failed to fetch market data")
                 return None
             
-            # Get current price for training data
+            # Get current price for training data using fallback
             current_price = None
             try:
-                response = requests.get(
-                    f"{config.binance_api_base}/ticker/price?symbol=BTCUSDT",
-                    timeout=5
-                )
-                current_price = float(response.json()["price"])
+                from market_data_fallback import FallbackMarketDataFetcher
+                async with FallbackMarketDataFetcher() as fetcher:
+                    current_price = await fetcher.fetch_current_price()
+                
+                if current_price is None:
+                    current_price = 50000.0  # Fallback
+                    monitor.logger.warning("Using fallback price")
             except Exception as e:
                 monitor.logger.warning(f"Failed to get current price: {e}")
                 current_price = 50000.0  # Fallback
