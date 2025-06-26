@@ -7,9 +7,9 @@ from typing import Optional
 @dataclass
 class MinerConfig:
     # Miner Identity
-    hotkey: str = "5DhoYw2EyGGqcXt3Cgnpcaf2VRCJcJYJntpwyQryphTgmYWs"  # Replace with your hotkey
-    wallet_name: str = "your_wallet_name"  # Replace with your wallet name
-    hotkey_name: str = "your_hotkey_name"   # Replace with your hotkey name
+    hotkey: str = "5HMci1Z3VS5QkdvDiWc8vLiwwD7YJb7VfTKEfmBwiD6G7joh"  # Replace with your hotkey
+    wallet_name: str = "c3"  # Replace with your wallet name
+    hotkey_name: str = "h1"   # Replace with your hotkey name
     
     # Network Settings
     netuid: int = 123
@@ -73,7 +73,7 @@ class MinerConfig:
     @property 
     def r2_public_url(self) -> str:
         # Replace with your actual R2 public URL format
-        return f"https://pub-your_public_hash.r2.dev/{self.hotkey}"
+        return f"https://pub-09f5de84cf104b3f8ce32bb6b2d774f9.r2.dev/{self.hotkey}"
 
 # Global config instance
 config = MinerConfig()
