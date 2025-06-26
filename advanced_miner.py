@@ -92,7 +92,7 @@ class AdvancedMiner:
             )
             
             # Test connection by listing bucket
-            self.s3_client.head_bucket(Bucket=config.hotkey)
+            self.s3_client.head_bucket(Bucket=config.r2_bucket_name)
             monitor.logger.info("R2 client setup successful")
             return True
             
@@ -248,8 +248,8 @@ class AdvancedMiner:
             
             # Upload to R2
             self.s3_client.put_object(
-                Bucket=config.hotkey,
-                Key=config.hotkey,  # Object key must match hotkey
+                Bucket=config.r2_bucket_name,  # Use bucket from config
+                Key=config.hotkey,              # Object key = hotkey
                 Body=payload_json.encode('utf-8'),
                 ContentType='application/json'
             )
